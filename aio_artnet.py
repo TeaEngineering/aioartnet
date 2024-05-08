@@ -3,15 +3,16 @@ import socket
 import struct
 import ipaddress
 import fcntl
-from typing import Optional
+from typing import Optional, Set
 import re
 
-from desk import ControllerUniverseOutput, NetNode, Controller, UniverseKey
-
-
-class ArtNetNode(NetNode):
-    def __init__(self, **kwargs) -> None:
-        super().__init__(**kwargs)
+from desk import (
+    ControllerUniverseOutput,
+    NetNode,
+    Controller,
+    UniverseKey,
+    DMX_UNIVERSE_SIZE,
+)
 
 
 ARTNET_PORT = 6454
@@ -44,13 +45,45 @@ def swap32(x: int) -> int:
 # Art-Net II switched over to UDP unicast from the universe publisher to
 # the subscriber(s).
 
-# We enumerate all networks offered by all nodes and offer them to the controller,
+# We enumerate all universes offered by all nodes and offer them to the controller,
 # merged by the 15-bit universe identifier. The controller can make a call to
 # subscribe, write, or broadcast each universe key, and we will manage the
 # art-poll-reply flags to make this work.
+#
 # We might recieved unsolicited broadcasts of a universe from other controllers,
 # (like QLC+) there's nothing we can do about this, but we drop them unless we
 # are in subscribe mode.
+
+# Each Node can publish one (artnet<3) or more (arcnet>3) sets of 4-ports.
+# Each set fixes a single net and sub_net value, however the choice
+# of universe nibble is determined per-port (net:sub_net:universe).
+# TODO: implement multiple pages (ArtFor now I have will implement a singl e
+
+
+class ArtNetNode(NetNode):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+
+    def __repr__(self):
+        return f"ArtNetNode<{self.name},{self.address}>"
+
+
+class ArtNetUniverse:
+    def __init__(self, portaddress: int):
+        if portaddress > 0x7FFF:
+            raise ValueError("Invalid net:subnet:universe, as net>128")
+        self.portaddress = portaddress
+        self.publishers: Set[ArtNetNode] = set()
+        self.subscribers: Set[ArtNetNode] = set()
+        self.last_data = bytearray(DMX_UNIVERSE_SIZE)
+
+    def __repr__(self):
+        net = self.portaddress >> 8
+        sub_net = (self.portaddress >> 4) & 0x0F
+        universe = self.portaddress & 0x0F
+        # name  net:sub_net:universe
+        # bits  8:15  4:8     0:4
+        return f"{net}:{sub_net}:{universe}"
 
 
 class ArtNetClientProtocol(asyncio.DatagramProtocol):
@@ -58,14 +91,14 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         self.client = client
         self.transport = None
         self.handlers = {0x2000: self.on_art_poll, 0x2100: self.on_art_poll_reply}
-        self.nodes: dict[int, ArtNetNode] = {}
         self.broadcast_ip = broadcast_ip
 
     def connection_made(self, transport):
         self.transport = transport
 
         sock = transport.get_extra_info("socket")
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         print("made:", self.transport)
 
@@ -90,7 +123,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             port,
             fw,
             netsw,
-            subsq,
+            subsw,
             oemCode,
             ubeaVer,
             status,
@@ -121,17 +154,39 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         portName = portName.rstrip(b"\000").decode()
         longName = longName.rstrip(b"\000").decode()
         print(
-            f"Received Art-Net PollReply: ip {ip} fw {fw} portName {portName} longName: {longName} port flags {ptype}"
+            f"Received Art-Net PollReply: ip {ip} fw {fw} portName {portName} longName: {longName} portflags {ptype} bindindex {bindindex}"
         )
 
         ipa = ipaddress.IPv4Address(swap32(ip))
 
-        nn = self.nodes.get(ip, None)
+        nn = self.client.nodes.get(ip, None)
         if nn is None:
             print("protocol adding node")
             nn = ArtNetNode(address=f"{ipa}:{port}", name=longName)
-            self.nodes[ip] = nn
-            self.client.add_node(nn)
+            self.client.add_node(ip, nn)
+
+        # do we know the universes?
+        for _type, _in, _out, _swin, _swout in zip(ptype, ins, outs, swin, swout):
+            print(f" port {_type} {_in} {_out} {_swin} {_swout} - {netsw} {subsw}")
+
+            in_port_addr = (
+                ((netsw & 0x7F) << 8) + ((subsw & 0x0F) << 4) + (_swin & 0x0F)
+            )
+            out_port_addr = (
+                ((netsw & 0x7F) << 8) + ((subsw & 0x0F) << 4) + (_swout & 0x0F)
+            )
+            if _type & 0b10000000:
+                outu = self.get_create_universe(out_port_addr)
+                print(f"  is output port {outu}")
+            if _type & 0b01000000:
+                inu = self.get_create_universe(in_port_addr)
+                print(f"  is input port {inu}")
+
+    def get_create_universe(self, port_addr):
+        if (u := self.client.universes.get(port_addr, None)) is None:
+            u = ArtNetUniverse(port_addr)
+            self.client.universes[port_addr] = u
+        return u
 
     async def send_art_poll(self):
         message = ARTNET_PREFIX + struct.pack("<HBBBB", 0x2000, 0, 14, 6, 16)
@@ -153,32 +208,32 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
 
 
 class ArtNetClient(ControllerUniverseOutput):
-    def __init__(self, host="localhost", port=9010, interface=None) -> None:
-
-        # self._request_counter = itertools.count()
-        self._host = host
-        self._port = port
-        self._writer: Optional[asyncio.StreamWriter] = None
-        self.nodes: list[NetNode] = []
+    def __init__(self, interface=None, net=0, subnet=0) -> None:
+        self.nodes: dict[int, ArtNetNode] = {}
         self.controller: Optional[Controller] = None
+        self.universes: dict[int, ArtNetUniverse] = {}
+        self.net = 0
+        self.subnet = 0
 
         if interface is None:
             interface = get_preferred_artnet_interface()
-
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            iface_bin = struct.pack("256s", bytes(interface, "utf-8"))
-            packet_ip = fcntl.ioctl(s.fileno(), SIOCGIFADDR, iface_bin)[20:24]
-            bcast = fcntl.ioctl(s.fileno(), SIOCGIFBRDADDR, iface_bin)[20:24]
-            self.broadcast = socket.inet_ntoa(bcast)
-            print(
-                f"using interface {interface} with ip {socket.inet_ntoa(packet_ip)} broadcast ip {self.broadcast}"
-            )
+        self.interface = interface
 
     async def connect(self, controller: Controller) -> asyncio.Future:
         print("connect")
         loop = asyncio.get_running_loop()
 
         on_con_lost = loop.create_future()
+
+        # lookup broadcast for provided interface
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            iface_bin = struct.pack("256s", bytes(self.interface, "utf-8"))
+            packet_ip = fcntl.ioctl(s.fileno(), SIOCGIFADDR, iface_bin)[20:24]
+            bcast = fcntl.ioctl(s.fileno(), SIOCGIFBRDADDR, iface_bin)[20:24]
+            self.broadcast = socket.inet_ntoa(bcast)
+            print(
+                f"using interface {self.interface} with ip {socket.inet_ntoa(packet_ip)} broadcast ip {self.broadcast}"
+            )
 
         # remote_addr=('192.168.1.255', ARTNET_PORT),
         transport, protocol = await loop.create_datagram_endpoint(
@@ -200,11 +255,11 @@ class ArtNetClient(ControllerUniverseOutput):
         pass
 
     def get_nodes(self) -> list[NetNode]:
-        return self.nodes
+        return list(self.nodes.values())
 
-    def add_node(self, node: ArtNetNode):
+    def add_node(self, ip: int, node: ArtNetNode):
         print("client adding node")
-        self.nodes.append(node)
+        self.nodes[ip] = node
         if self.controller:
             self.controller.add_node(node)
 
@@ -224,7 +279,6 @@ def get_iface_ip(iface: str):
         return map(socket.inet_ntoa, [packet_ip, netmask, bcast])
     except OSError:
         return None, None, None
-    # socket.inet_ntoa(fcntl.ioctl(s, 35099, struct.pack('256s', iface))[20:24])
 
 
 def get_preferred_artnet_interface() -> str:
