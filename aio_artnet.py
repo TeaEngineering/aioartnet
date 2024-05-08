@@ -6,15 +6,12 @@ import fcntl
 from typing import Optional
 import re
 
-from desk import ControllerUniverseOutput, NetNode, Controller
+from desk import ControllerUniverseOutput, NetNode, Controller, UniverseKey
 
 
 class ArtNetNode(NetNode):
     def __init__(self, **kwargs) -> None:
-
         super().__init__(**kwargs)
-
-    pass
 
 
 ARTNET_PORT = 6454
@@ -32,10 +29,28 @@ SIOCGIFFLAGS = 0x8913
 PREFERED_INTERFACES_ORDER = ["enp.*", "wlp.*"]
 
 
-def swap32(x):
+# helper to de-tangle some of the protocol endianness. Fields like IP address
+# are stored as 4 consecutive bytes, but not in little-endian like the rest of the
+# protocol. Better to read as a 32-bit int in struct.unpack and then byteswap it
+def swap32(x: int) -> int:
     return int.from_bytes(
         x.to_bytes(4, byteorder="little"), byteorder="big", signed=False
     )
+
+
+# The broadcast IP is used for locating nodes and managing subscriptions.
+# Art-Net I and II protocols also used it for sending DMX data, and many
+# implementations are backwards compatible.
+# Art-Net II switched over to UDP unicast from the universe publisher to
+# the subscriber(s).
+
+# We enumerate all networks offered by all nodes and offer them to the controller,
+# merged by the 15-bit universe identifier. The controller can make a call to
+# subscribe, write, or broadcast each universe key, and we will manage the
+# art-poll-reply flags to make this work.
+# We might recieved unsolicited broadcasts of a universe from other controllers,
+# (like QLC+) there's nothing we can do about this, but we drop them unless we
+# are in subscribe mode.
 
 
 class ArtNetClientProtocol(asyncio.DatagramProtocol):
@@ -181,9 +196,7 @@ class ArtNetClient(ControllerUniverseOutput):
 
         return on_con_lost
 
-    async def set_dmx(
-        self, universe: int = 0, data: bytes = b"\0\0", priority: int = 0
-    ):
+    async def set_dmx(self, universe: UniverseKey, data: bytes):
         pass
 
     def get_nodes(self) -> list[NetNode]:
