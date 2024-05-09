@@ -1,11 +1,12 @@
 import struct
 
 from aio_artnet import ArtNetUniverse, ArtNetClient, ArtNetClientProtocol
-from typing import Iterator, Tuple
+from typing import Iterator, Tuple, Any
 import pytest
+import socket
+from test_controller import ChangeCounter
 
-
-def test_universe():
+def test_universe() -> None:
     assert str(ArtNetUniverse(4)) == "0:0:4"
     assert str(ArtNetUniverse(0x15)) == "0:1:5"
     assert str(ArtNetUniverse(0x315)) == "3:1:5"
@@ -37,28 +38,47 @@ def packet_reader(file: str) -> Iterator[Tuple[float, bytes]]:
             packet = f.read(filesz)
             yield time, packet
 
+class MockTransport:
+    def __init__(self):
+        self.sent = []
 
-def test_artnet_poll_reply():
+    def get_extra_info(self, key: str) -> Any:
+        return None
 
-    # play a short pcap recording of Art-Net polls then inspect the resulting data
+    def sendto(self, data, addr=None):
+        self.sent.append((data, addr))
+
+def test_artnet_poll_reply() -> None:
+
+    # play a short pcap recording of Art-Net polls & replies then inspect the resulting data
     # fake client.connect being called by manually building the protocol
     client = ArtNetClient(interface="dummy")
-    proto = ArtNetClientProtocol("10.10.10.255", client)
+    client.broadcast_ip = "10.10.10.255"
+    client.unicast_ip = "10.10.10.10"
+
+    proto = ArtNetClientProtocol(client)
+    transport = MockTransport()
+    proto.connection_made(transport)
 
     for _, pkt in packet_reader("tests/artnet-nodes.pcap"):
         udp = pkt[42:]
-        addr = pkt[26:30]  # TODO format addr?
-        print(f"ip {addr} data {udp}")
-        proto.datagram_received(udp, addr)
+        ip = socket.inet_ntoa(pkt[26:30])
+        port, = struct.unpack('>H', pkt[34:36])
+        print(f"UDP ip {ip}:{port} data {udp}")
+        # package up the sending address as a tuple like asyncio
+        proto.datagram_received(udp, (ip, port))
 
     assert len(client.nodes) == 2
-    assert len(client.universes) == 4
+    # assert len(client.universes) == 4
     assert list(map(str, client.universes.values())) == [
         "0:0:0",
         "0:0:1",
         "0:0:2",
         "0:0:3",
+        "0:0:8",
     ]
+    # Note that 0:0:8 is being broadcasted to without the node (QLC+) listing the port
+    # in its node output port configuration
     print(client.nodes)
     assert (
         str(client.nodes[3724650688])
@@ -68,3 +88,26 @@ def test_artnet_poll_reply():
         str(client.nodes[3439438016])
         == "ArtNetNode<Q Light Controller Plus - ArtNet interface,192.168.1.205:6454>"
     )
+
+    # last publisher seq stored by (address,physicalport)
+    assert client.universes[8].last_data[0] == 0
+    assert client.universes[8].last_data[1] == 0x70
+    assert client.universes[8].last_data[2] == 0x94
+    assert client.universes[8].publisherseq == {('192.168.1.205', 0): 20}
+
+    assert client.universes[2].last_data[1] == 0
+    assert client.universes[2].publisherseq == {('192.168.1.205', 0): 85}
+
+    # DMX Monitor for iPhone binds from page 1, identifies as a desk
+    assert client.nodes[3724650688].portBinds == {1 : True}
+    assert client.nodes[3724650688].style == 1
+
+    # QLC binds from page 0, identifies as a node
+    assert client.nodes[3439438016].portBinds == {0: True}
+    assert client.nodes[3439438016].style == 0
+
+    # our node should have replied to the poll
+    assert len(transport.sent) == 1
+    pollreply, addr = transport.sent[0]
+    assert addr == (client.broadcast_ip, 6454)
+    # assert len(pollreply) == 88
