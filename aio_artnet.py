@@ -40,7 +40,7 @@ SIOCGIFFLAGS = 0x8913
 PREFERED_INTERFACES_ORDER = ["enp.*", "wlp.*"]
 
 # register a logger so that our debug can be enabled if required
-logger = logging.getLogger('aioartnet')
+logger = logging.getLogger("aioartnet")
 
 
 # helper to de-tangle some of the protocol endianness. Fields like IP address
@@ -80,15 +80,22 @@ def swap16(x: int) -> int:
 
 
 class ArtNetNode:
-    def __init__(self, name="name", address="address") -> None:
-        self.name = name
+    def __init__(
+        self,
+        longName: str = "name",
+        portName: str = "",
+        address: str = "",
+        style: int = 0,
+    ) -> None:
+        self.portName = portName
+        self.longName = longName
         self.address = address
         self.portBinds: defaultdict[int, list[ArtNetPort]] = defaultdict(list)
         self.ports = []
-        self.style = 0
+        self.style = style
 
     def __repr__(self):
-        return f"ArtNetNode<{self.name},{self.address}>"
+        return f"ArtNetNode<{self.portName},{self.address}>"
 
 
 class ArtNetUniverse:
@@ -112,7 +119,14 @@ class ArtNetUniverse:
 
 
 class ArtNetPort:
-    def __init__(self, node: ArtNetNode, isinput: bool, media: int, portaddr: int, universe: ArtNetUniverse):
+    def __init__(
+        self,
+        node: ArtNetNode,
+        isinput: bool,
+        media: int,
+        portaddr: int,
+        universe: ArtNetUniverse,
+    ):
         self.node = node
         self.isinput = isinput
         self.media = 0
@@ -136,6 +150,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             0x2100: self.on_art_poll_reply,
             0x5000: self.on_art_dmx,
         }
+        client.protocol = self
 
     def connection_made(self, transport):
         self.transport = transport
@@ -203,11 +218,28 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         ipa = ipaddress.IPv4Address(swap32(ip))
 
         nn = self.client.nodes.get(ip, None)
-        if nn is None:
-            nn = ArtNetNode(address=f"{ipa}:{port}", name=longName)
-            self.client.add_node(ip, nn)
+        changed = False
+        if nn is not None:
+            changed |= nn.longName != longName
+            changed |= nn.portName != portName
+            changed |= nn.style != style
+            logger.debug(f"change detection on {nn} => {changed}")
 
-        # do we know the universes?
+        if nn is None or changed:
+            newnode = ArtNetNode(
+                address=f"{ipa}:{port}",
+                longName=longName,
+                portName=portName,
+                style=style,
+            )
+            if changed:
+                logger.debug(f"change detected: from {nn} to {newnode}")
+
+            # TODO: make client.node observable dict and remove this method
+            self.client.add_node(ip, newnode)
+            nn = newnode
+
+        # iterate through the ports and create ports and universes
         portList = []
         for _type, _in, _out, _swin, _swout in zip(ptype, ins, outs, swin, swout):
             in_port_addr = (
@@ -218,19 +250,23 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             )
             if _type & 0b10000000:
                 outu = self.get_create_universe(out_port_addr)
-                portList.append(ArtNetPort(nn, False, _type & 0x1F, out_port_addr, outu))
+                portList.append(
+                    ArtNetPort(nn, False, _type & 0x1F, out_port_addr, outu)
+                )
             if _type & 0b01000000:
                 inu = self.get_create_universe(in_port_addr)
                 portList.append(ArtNetPort(nn, True, _type & 0x1F, in_port_addr, inu))
 
         # track which 'pages' of port bindings we have seen
-        old = nn.portBinds[bindindex]
+        old_ports = nn.portBinds[bindindex]
         for p in portList:
-            if p not in old:
+            if p not in old_ports:
                 nn.ports.append(p)
                 nn.portBinds[bindindex].append(p)
-
-        nn.style = style
+        for p in list(old_ports):
+            if p not in portList:
+                nn.ports.remove(p)
+                mm.portBinds[bindindex].remove(p)
 
         logger.info(
             f"Received Art-Net PollReply from {ip} fw {fw} portName {portName} longName: {longName} bindindex {bindindex} ports:{portList}"
@@ -279,12 +315,15 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             self.client.universes[port_addr] = u
         return u
 
-    async def send_art_poll(self):
-        message = ARTNET_PREFIX + struct.pack("<HBBBB", 0x2000, 0, 14, 6, 16)
+    async def art_poll_task(self):
         while True:
             await asyncio.sleep(3)
-            logger.debug(f"sending poll to {self.client.broadcast_ip}")
-            self.transport.sendto(message, addr=(self.client.broadcast_ip, ARTNET_PORT))
+            self._send_art_poll()
+
+    def _send_art_poll(self):
+        message = ARTNET_PREFIX + struct.pack("<HBBBB", 0x2000, 0, 14, 6, 16)
+        logger.debug(f"sending poll to {self.client.broadcast_ip}")
+        self.transport.sendto(message, addr=(self.client.broadcast_ip, ARTNET_PORT))
 
     def send_art_poll_reply(self, addr) -> None:
         bindindex = 1
@@ -323,8 +362,8 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             0,
             0,
             esta,
-            self.client.portName.encode(),
-            self.client.longName.encode(),
+            self.client._portName.encode(),
+            self.client._longName.encode(),
             b"",
             len(ports),
             ptype,
@@ -335,7 +374,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             0,
             0,
             0,
-            self.client.style,
+            self.client._style,
             mac,
             bindip,
             bindindex,
@@ -356,17 +395,19 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
 
 
 class ArtNetClient(ControllerUniverseOutput):
-    def __init__(self, interface=None, net=0, subnet=0, passive=False) -> None:
+    def __init__(
+        self, interface=None, net=0, subnet=0, passive=False, portName="aioartnet"
+    ) -> None:
         self.nodes: dict[int, ArtNetNode] = {}
         self.controller: Optional[Controller] = None
         self.universes: dict[int, ArtNetUniverse] = {}
         self.net = 0
         self.subnet = 0
         self.ports = []
-        self.portName = "aio_artnet"
-        self.longName = "aio_artnet (ola_pilot)"
+        self._portName = portName
+        self._longName = f"{portName} (aioartnet)"
         # identify as an StController, see Table 4 'Style Codes' p23
-        self.style = 1
+        self._style = 1
         self.passive = passive
 
         if interface is None:
@@ -374,6 +415,7 @@ class ArtNetClient(ControllerUniverseOutput):
         self.interface = interface
         self.broadcast_ip = None
         self.unicast_ip = None
+        self.protocol: Optional[ArtNetClientProtocol]
 
     async def connect(self, controller: Controller) -> asyncio.Future:
         loop = asyncio.get_running_loop()
@@ -399,10 +441,9 @@ class ArtNetClient(ControllerUniverseOutput):
             allow_broadcast=True,
         )
         if not self.passive:
-            asyncio.create_task(protocol.send_art_poll())
+            asyncio.create_task(protocol.art_poll_task())
 
         self.transport = transport
-        self.protocol = protocol
         self.controller = controller
 
         return on_con_lost
@@ -424,6 +465,38 @@ class ArtNetClient(ControllerUniverseOutput):
             # parse to int
             net, sub, univ = map(int, universe.split(":"))
             port_addr = ((net & 0x7F) << 8) + ((sub & 0x0F) << 4) + (univ & 0x0F)
+
+    # if you need to change a lot of properties in bulk, set client.passive=True,
+    # make the required changes then clear .passive
+    @property
+    def portName(self):
+        return self._portName
+
+    @portName.setter
+    def portName(self, value: str) -> None:
+        self._portName = value
+        if not self.passive and self.protocol:
+            self.protocol._send_art_poll()
+
+    @property
+    def longName(self):
+        return self._longName
+
+    @longName.setter
+    def longName(self, value: str) -> None:
+        self._longName = value
+        if not self.passive and self.protocol:
+            self.protocol._send_art_poll()
+
+    @property
+    def style(self):
+        return self._style
+
+    @longName.setter
+    def style(self, value: int) -> None:
+        self._style = value
+        if not self.passive and self.protocol:
+            self.protocol._send_art_poll()
 
 
 def get_iface_ip(iface: str):
@@ -470,7 +543,6 @@ def get_preferred_artnet_interface() -> str:
 
 
 async def main():
-
     client = ArtNetClient()
     on_con_lost = await client.connect(None)
     # print(await client.get_dmx(universe=1))
