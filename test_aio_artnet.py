@@ -81,14 +81,8 @@ def test_artnet_poll_reply() -> None:
     ]
     # Note that 0:0:8 is being broadcasted to without the node (QLC+) listing the port
     # in its node output port configuration
-    assert (
-        str(client.nodes[3724650688])
-        == "ArtNetNode<DMX Monitor,192.168.1.222:6454>"
-    )
-    assert (
-        str(client.nodes[3439438016])
-        == "ArtNetNode<QLC+,192.168.1.205:6454>"
-    )
+    assert str(client.nodes[3724650688]) == "ArtNetNode<DMX Monitor,192.168.1.222:6454>"
+    assert str(client.nodes[3439438016]) == "ArtNetNode<QLC+,192.168.1.205:6454>"
 
     # last publisher seq stored by (address,physicalport)
     assert client.universes[8].last_data[0] == 0
@@ -100,12 +94,12 @@ def test_artnet_poll_reply() -> None:
     assert client.universes[2].publisherseq == {("192.168.1.205", 0): 85}
 
     # DMX Monitor for iPhone binds from page 1, identifies as a desk
-    assert client.nodes[3724650688].portBinds == {1: []}
+    assert client.nodes[3724650688]._portBinds == {1: []}
     assert client.nodes[3724650688].style == 1
 
     # QLC binds from page 0, identifies as a node
-    assert len(client.nodes[3439438016].portBinds) == 1
-    ports = client.nodes[3439438016].portBinds[0]
+    assert len(client.nodes[3439438016]._portBinds) == 1
+    ports = client.nodes[3439438016]._portBinds[0]
     assert list(map(str, ports)) == [
         "Port<Output,DMX,0:0:0>",
         "Port<Output,DMX,0:0:1>",
@@ -126,7 +120,7 @@ def test_artnet_poll_reply() -> None:
     proto.datagram_received(pollreply, addr)
     assert len(client.nodes) == 3
     nn = client.nodes[168430090]
-    assert nn.portBinds == {1: []}
+    assert nn._portBinds == {1: []}
     assert str(nn) == "ArtNetNode<aioartnet,10.10.10.10:6454>"
 
 
@@ -136,17 +130,17 @@ def test_artnet_poll_reply() -> None:
 #  ie. a send can trigger a rx that triggers a send that arrives in the
 #    middle of the original send. normally event loops don't do this.
 class BroadcastTransport:
-    def __init__(self, protocols=[]):
+    def __init__(self, protocols=[]) -> None:
         self.protos = list(protocols)
-        self.pending: deque[bytes] = deque()
+        self.pending: deque[Tuple[bytes,Any]] = deque()
 
-    def connect_protocol(protocol):
+    def connect_protocol(self, protocol) -> None:
         self.protos.append(protocol)
 
     def get_extra_info(self, key: str) -> Any:
         return None
 
-    def sendto(self, data, addr=None):
+    def sendto(self, data, addr=None) -> None:
         self.pending.append((data, addr))
 
     def drain(self) -> None:
@@ -157,7 +151,7 @@ class BroadcastTransport:
 
 
 @pytest.mark.asyncio
-async def test_artnet_back_to_back():
+async def test_artnet_back_to_back_nodes():
     # use two instances of our client linked by a mock transport to test
     # port and node detection
 
@@ -194,6 +188,54 @@ async def test_artnet_back_to_back():
     transport.drain()
 
     assert (
+        str(list(clA.nodes.values()))
+        == "[ArtNetNode<alpha,10.10.10.10:6454>, ArtNetNode<charlie,10.10.10.2:6454>]"
+    )
+    assert (
         str(list(clB.nodes.values()))
         == "[ArtNetNode<alpha,10.10.10.10:6454>, ArtNetNode<charlie,10.10.10.2:6454>]"
     )
+
+
+@pytest.mark.asyncio
+async def test_ports():
+    # use one instance of client with a mock loopback transport to test
+    # port and node detection
+
+    clA = ArtNetClient(interface="dummy", portName="alpha")
+    clA.broadcast_ip = "10.10.10.255"
+    clA.unicast_ip = "10.10.10.10"
+    u = clA.set_port_config("1:0:7", isinput=True)
+
+    protoA = ArtNetClientProtocol(clA)
+
+    transport = BroadcastTransport([protoA])
+    protoA.connection_made(transport)
+
+    # send, then flush the poll/reply packets
+    protoA._send_art_poll()
+    transport.drain()
+
+    assert len(clA.nodes) == 1
+    assert len(clA.ports) == 1
+    assert str(clA._portBinds) == "{1: [Port<Input,DMX,1:0:7>]}"
+
+    # check the *recieved* view of the same packets match
+    assert str(list(clA.nodes.values())[0].ports) == "[Port<Input,DMX,1:0:7>]"
+    assert list(clA.universes.keys()) == [263]
+    assert str(clA.universes[263].publishers) == "[ArtNetNode<alpha,10.10.10.10:6454>]"
+    assert clA.universes[263].subscribers == []
+
+    # disable existing, add an output port
+    u = clA.set_port_config("1:0:7")
+    u = clA.set_port_config("0:1:8", isoutput=True)
+
+    transport.drain()
+    assert str(clA._portBinds) == "{1: [Port<Output,DMX,0:1:8>]}"
+    assert str(list(clA.nodes.values())[0].ports) == "[Port<Output,DMX,0:1:8>]"
+
+    assert clA.universes[263].publishers == []
+    assert clA.universes[263].subscribers == []
+    print(clA.universes)
+    assert clA.universes[24].publishers == []
+    assert str(clA.universes[24].subscribers) == "[ArtNetNode<alpha,10.10.10.10:6454>]"
