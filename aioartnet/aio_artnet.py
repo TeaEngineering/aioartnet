@@ -73,6 +73,7 @@ def swap16(x: int) -> int:
 # Each set fixes a single net and sub_net value, however the choice
 # of universe nibble is determined per-port (net:sub_net:universe).
 
+
 class ArtNetNode:
     def __init__(
         self,
@@ -450,7 +451,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
 UniverseKey = int | str | ArtNetUniverse
 
 
-class ArtNetClient():
+class ArtNetClient:
     def __init__(
         self, interface=None, net=0, subnet=0, passive=False, portName="aioartnet"
     ) -> None:
