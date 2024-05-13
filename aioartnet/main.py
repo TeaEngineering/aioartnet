@@ -9,18 +9,16 @@ async def main() -> None:
     await client.connect()
     u = client.set_port_config("0:0:1", isinput=True)
     u.last_data[0:100] = range(100)
-
     u2 = client.set_port_config("0:0:5", isoutput=True)
 
     while True:
         await asyncio.sleep(5)
         print("status:")
         for n, node in client.nodes.items():
-            print(f"{node!r: <60} {node.ports}")
+            print(f" {node!r: <60} {node.ports}")
 
         for univ in client.universes.values():
             print(f" {univ} pubs:{univ.publishers} subs:{univ.subscribers}")
-            print(univ.publisherseq)
 
         print(u2.last_data[0:20])
 

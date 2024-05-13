@@ -178,7 +178,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
     def on_art_poll(self, addr: DGAddr, data: bytes) -> None:
         ver, flags, priority = struct.unpack("<HBB", data)
         ver = swap16(ver)
-        logger.info(
+        logger.debug(
             f"Received Art-Net Poll: ver {ver} flags {flags} prio: {priority} from {addr}"
         )
         self.send_art_poll_reply()
@@ -284,7 +284,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
                 {True: p.universe.publishers, False: p.universe.subscribers}[
                     p.isinput
                 ].remove(nn)
-        logger.info(
+        logger.debug(
             f"Received Art-Net PollReply from {ip} fw {fw} portName {portName} longName: {longName} bindindex {bindindex} ports:{portList}"
         )
 
@@ -441,7 +441,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         )
         message = message + universe.last_data
 
-        logger.info(f"sending dmx for {universe} to {node} at {node._addr}")
+        logger.debug(f"sending dmx for {universe} to {node} at {node._addr}")
         if self.transport:
             self.transport.sendto(message, addr=node._addr)
 
@@ -565,12 +565,14 @@ class ArtNetClient:
                 break
         if port:
             self.ports.remove(port)
+            logger.info(f"removed own port {port}")
 
         if isinput or isoutput:
             port = ArtNetPort(
                 node=self, isinput=isinput, media=0, portaddr=port_addr, universe=u
             )
             self.ports.append(port)
+            logger.info(f"configured own port {port}")
 
         # TODO: optimise the layour of self.ports to self._portBinds
         # up to four ports with a common (net,sub-net) can be listed on the same page
