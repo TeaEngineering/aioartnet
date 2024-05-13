@@ -4,7 +4,7 @@ import struct
 import ipaddress
 import fcntl
 import logging
-from typing import Optional, Tuple, Any, cast
+from typing import Optional, Tuple, Any, cast, Union
 import re
 import time
 from collections import defaultdict
@@ -73,7 +73,7 @@ def swap16(x: int) -> int:
 # Each set fixes a single net and sub_net value, however the choice
 # of universe nibble is determined per-port (net:sub_net:universe).
 
-DGAddr = tuple[str | Any, int]
+DGAddr = tuple[Union[str, Any], int]
 
 
 class ArtNetNode:
@@ -126,7 +126,7 @@ class ArtNetUniverse:
 class ArtNetPort:
     def __init__(
         self,
-        node: "ArtNetNode|ArtNetClient",
+        node: Union[ArtNetNode, "ArtNetClient"],
         isinput: bool,
         media: int,
         portaddr: int,
@@ -450,11 +450,11 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
     def error_received(self, exc: Exception) -> None:
         logger.warn("Error received:", exc)
 
-    def connection_lost(self, exc: Exception | None) -> None:
+    def connection_lost(self, exc: Optional[Exception]) -> None:
         logger.warn("Connection closed")
 
 
-UniverseKey = int | str | ArtNetUniverse
+UniverseKey = Union[int, str, ArtNetUniverse]
 
 
 class ArtNetClient:
@@ -633,7 +633,7 @@ class ArtNetClient:
             self.protocol.send_art_poll_reply()
 
 
-def get_iface_ip(iface: str) -> tuple[str, str, str] | None:
+def get_iface_ip(iface: str) -> Optional[tuple[str, str, str]]:
     """
     Get network interface IP using the network interface name
     :param iface: Interface name (like eth0, enp2s0, etc.)
