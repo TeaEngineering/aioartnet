@@ -12,7 +12,7 @@ name = "aioartnet"
 authors = [
   { name="Chris Shucksmith", email="chris@teaengineering.co.uk" },
 ]
-description = "Pure Python asyncio connector to Art-Net"
+description = "Pure Python asyncio connector to Art-Net DMX Universes"
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = [
