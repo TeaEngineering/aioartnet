@@ -4,7 +4,7 @@ import struct
 import ipaddress
 import fcntl
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any, cast
 import re
 import time
 from collections import defaultdict
@@ -73,6 +73,8 @@ def swap16(x: int) -> int:
 # Each set fixes a single net and sub_net value, however the choice
 # of universe nibble is determined per-port (net:sub_net:universe).
 
+DGAddr = tuple[str | Any, int]
+
 
 class ArtNetNode:
     def __init__(
@@ -92,7 +94,7 @@ class ArtNetNode:
         self.style: int = style
         self.last_reply: float = 0.0
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"ArtNetNode<{self.portName},{self.address}>"
 
 
@@ -106,7 +108,7 @@ class ArtNetUniverse:
         self.last_data = bytearray(DMX_UNIVERSE_SIZE)
         self._last_seq = 1
         self._last_publish: float = 0.0
-        self.publisherseq: dict[Tuple[int, int], int] = {}
+        self.publisherseq: dict[Tuple[DGAddr, int], int] = {}
 
     def split(self) -> Tuple[int, int, int]:
         # name  net:sub_net:universe
@@ -116,7 +118,7 @@ class ArtNetUniverse:
         universe = self.portaddress & 0x0F
         return net, sub_net, universe
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         net, sub_net, universe = self.split()
         return f"{net}:{sub_net}:{universe}"
 
@@ -124,7 +126,7 @@ class ArtNetUniverse:
 class ArtNetPort:
     def __init__(
         self,
-        node: ArtNetNode,
+        node: "ArtNetNode|ArtNetClient",
         isinput: bool,
         media: int,
         portaddr: int,
@@ -136,7 +138,7 @@ class ArtNetPort:
         self.portaddr = portaddr
         self.universe = universe
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         inout = {True: "Input", False: "Output"}[self.isinput]
         media = ["DMX", "MIDI", "Avab", "Colortran CMX", "ADB 62.5", "Art-Net", "DALI"][
             self.media
@@ -156,13 +158,13 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         }
         client.protocol = self
 
-    def connection_made(self, transport):
-        self.transport = transport
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = cast(asyncio.DatagramTransport, transport)
         sock = transport.get_extra_info("socket")
         if sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    def datagram_received(self, data: bytes, addr):
+    def datagram_received(self, data: bytes, addr: DGAddr) -> None:
         if data[0:8] == ARTNET_PREFIX:
             (opcode,) = struct.unpack("H", data[8:10])
             h = self.handlers.get(opcode, None)
@@ -174,7 +176,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         else:
             print(f"Received non Art-Net data from {addr}: {data!r}")
 
-    def on_art_poll(self, addr, data: bytes) -> None:
+    def on_art_poll(self, addr: DGAddr, data: bytes) -> None:
         ver, flags, priority = struct.unpack("<HBB", data)
         ver = swap16(ver)
         logger.info(
@@ -182,7 +184,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         )
         self.send_art_poll_reply()
 
-    def on_art_poll_reply(self, addr, data: bytes) -> None:
+    def on_art_poll_reply(self, addr: DGAddr, data: bytes) -> None:
         # everything up to the mac address field is mandatory, the rest must be
         # parsed only if it is sent (field at a time)
         ip, port, fw, netsw, subsw, oemCode = struct.unpack("<IHHBBH", data[0:12])
@@ -287,7 +289,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             f"Received Art-Net PollReply from {ip} fw {fw} portName {portName} longName: {longName} bindindex {bindindex} ports:{portList}"
         )
 
-    def on_art_dmx(self, addr, data: bytes) -> None:
+    def on_art_dmx(self, addr: DGAddr, data: bytes) -> None:
         ver, seq, phys, sub, net, chlen = struct.unpack("<HBBBBH", data[0:8])
         ver = swap16(ver)
         chlen = swap16(chlen)
@@ -310,7 +312,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         # ie. the spec envisions that a single node with two input ports could output
         # them both on Art-Net to the same universe. The reciever would disambiguate
         # the senders by ip_address+phys (see p62)
-        publisherkey = (addr[0], phys)
+        publisherkey = (addr, phys)
 
         # TODO: check seq field for packet re-ordering and loss detection
         # a seq of 0 is considered always 'in sequence' as the sender is not
@@ -324,7 +326,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         # Only two sources are allowed to contribute to the values in the universe
         u.last_data[0:chlen] = data[8 : 8 + chlen]
 
-    async def art_poll_task(self):
+    async def art_poll_task(self) -> None:
         while True:
             await asyncio.sleep(0.1)
             t = time.time()
@@ -340,7 +342,8 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         self._last_poll = time.time()
         message = ARTNET_PREFIX + struct.pack("<HBBBB", 0x2000, 0, 14, 6, 16)
         logger.debug(f"sending poll to {self.client.broadcast_ip}")
-        self.transport.sendto(message, addr=(self.client.broadcast_ip, ARTNET_PORT))
+        if self.transport:
+            self.transport.sendto(message, addr=(self.client.broadcast_ip, ARTNET_PORT))
 
     def _send_art_dmx(self, u: ArtNetUniverse) -> None:
         u._last_publish = time.time()
@@ -357,6 +360,8 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         self, bindindex: int, ports: list[ArtNetPort]
     ) -> None:
         bindindex = 1
+        if not self.client.unicast_ip:
+            return
         ip = int.from_bytes(
             socket.inet_aton(self.client.unicast_ip), byteorder="little", signed=False
         )
@@ -439,12 +444,13 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         message = message + universe.last_data
 
         logger.info(f"sending dmx for {universe} to {node} at {node._addr}")
-        self.transport.sendto(message, addr=node._addr)
+        if self.transport:
+            self.transport.sendto(message, addr=node._addr)
 
-    def error_received(self, exc):
+    def error_received(self, exc: Exception) -> None:
         logger.warn("Error received:", exc)
 
-    def connection_lost(self, exc):
+    def connection_lost(self, exc: Exception | None) -> None:
         logger.warn("Connection closed")
 
 
@@ -453,7 +459,12 @@ UniverseKey = int | str | ArtNetUniverse
 
 class ArtNetClient:
     def __init__(
-        self, interface=None, net=0, subnet=0, passive=False, portName="aioartnet"
+        self,
+        interface: Optional[str] = None,
+        net: int = 0,
+        subnet: int = 0,
+        passive: bool = False,
+        portName: str = "aioartnet",
     ) -> None:
         self.nodes: dict[int, ArtNetNode] = {}
         self.universes: dict[int, ArtNetUniverse] = {}
@@ -472,9 +483,9 @@ class ArtNetClient:
         self._publishing: list[ArtNetUniverse] = []
         if interface is None:
             interface = get_preferred_artnet_interface()
-        self.interface = interface
+        self.interface: str = interface
 
-    async def connect(self) -> asyncio.Future:
+    async def connect(self) -> asyncio.Future[None]:
         loop = asyncio.get_running_loop()
 
         on_con_lost = loop.create_future()
@@ -505,7 +516,7 @@ class ArtNetClient:
 
         return on_con_lost
 
-    async def set_dmx(self, universe: UniverseKey, data: bytes):
+    async def set_dmx(self, universe: UniverseKey, data: bytes) -> None:
         port_addr = self._parse_universe(universe)
 
         # where to keep our write buffer?
@@ -521,7 +532,7 @@ class ArtNetClient:
     def get_nodes(self) -> list[ArtNetNode]:
         return list(self.nodes.values())
 
-    def add_node(self, ip: int, node: ArtNetNode):
+    def add_node(self, ip: int, node: ArtNetNode) -> None:
         self.nodes[ip] = node
 
     def _parse_universe(self, universe: UniverseKey) -> int:
@@ -539,7 +550,7 @@ class ArtNetClient:
             raise ValueError(f"invalid universe: {universe}")
 
     def set_port_config(
-        self, universe: UniverseKey, isinput=False, isoutput=False
+        self, universe: UniverseKey, isinput: bool = False, isoutput: bool = False
     ) -> ArtNetUniverse:
         port_addr = self._parse_universe(universe)
 
@@ -559,7 +570,7 @@ class ArtNetClient:
 
         if isinput or isoutput:
             port = ArtNetPort(
-                node=None, isinput=isinput, media=0, portaddr=port_addr, universe=u
+                node=self, isinput=isinput, media=0, portaddr=port_addr, universe=u
             )
             self.ports.append(port)
 
@@ -592,7 +603,7 @@ class ArtNetClient:
     # if you need to change a lot of properties in bulk, set client.passive=True,
     # make the required changes, then clear .passive
     @property
-    def portName(self):
+    def portName(self) -> str:
         return self._portName
 
     @portName.setter
@@ -602,7 +613,7 @@ class ArtNetClient:
             self.protocol.send_art_poll_reply()
 
     @property
-    def longName(self):
+    def longName(self) -> str:
         return self._longName
 
     @longName.setter
@@ -612,7 +623,7 @@ class ArtNetClient:
             self.protocol.send_art_poll_reply()
 
     @property
-    def style(self):
+    def style(self) -> int:
         return self._style
 
     @style.setter
@@ -622,7 +633,7 @@ class ArtNetClient:
             self.protocol.send_art_poll_reply()
 
 
-def get_iface_ip(iface: str):
+def get_iface_ip(iface: str) -> tuple[str, str, str] | None:
     """
     Get network interface IP using the network interface name
     :param iface: Interface name (like eth0, enp2s0, etc.)
@@ -634,30 +645,31 @@ def get_iface_ip(iface: str):
             packet_ip = fcntl.ioctl(s, SIOCGIFADDR, iface_bin)[20:24]
             netmask = fcntl.ioctl(s, SIOCGIFNETMASK, iface_bin)[20:24]
             bcast = fcntl.ioctl(s, SIOCGIFBRDADDR, iface_bin)[20:24]
-        return map(socket.inet_ntoa, [packet_ip, netmask, bcast])
+        a, b, c = map(socket.inet_ntoa, [packet_ip, netmask, bcast])
+        return a, b, c
     except OSError:
-        return None, None, None
+        return None
 
 
 def get_preferred_artnet_interface() -> str:
     preferred = []
-    matchers = list(map(re.compile, PREFERED_INTERFACES_ORDER))
+    patterns = list(map(re.compile, PREFERED_INTERFACES_ORDER))
     for idx, name in socket.if_nameindex():
-        packet, netmask, bcast = get_iface_ip(name)
-        logger.debug(f"interface idx={idx} name={name} {packet} {netmask} {bcast}")
-        # looks like an explicit class-A primary interface for Art-Net
-        if packet is None:
-            # no ip address, skip
-            pass
-        elif netmask == "255.0.0.0" and packet.startswith("2."):
-            preferred.append((-1, name))
-        else:
-            for i, p in enumerate(matchers):
-                if re.match(p, name):
-                    preferred.append((i, name))
-                    break
+        if p := get_iface_ip(name):
+            packet, netmask, bcast = p
+            logger.debug(f"interface idx={idx} name={name} {packet} {netmask} {bcast}")
+            # looks like an explicit class-A primary interface for Art-Net
+            if netmask == "255.0.0.0" and packet.startswith("2."):
+                preferred.append((-1, name))
             else:
-                preferred.append((10, name))
+                for i, pattern in enumerate(patterns):
+                    if re.match(pattern, name):
+                        preferred.append((i, name))
+                        break
+                else:
+                    preferred.append((10, name))
+        else:
+            logger.debug(f"interface idx={idx} name={name} has no IP")
 
     preferred = sorted(preferred)
     logger.info(f"preferred interfaces: {preferred}")
@@ -665,9 +677,9 @@ def get_preferred_artnet_interface() -> str:
     return interface
 
 
-async def main():
+async def main() -> None:
     client = ArtNetClient()
-    await client.connect(None)
+    await client.connect()
     u = client.set_port_config("0:0:1", isinput=True)
     u.last_data[0:100] = range(100)
 
@@ -679,7 +691,7 @@ async def main():
         for n, node in client.nodes.items():
             print(f"{node!r: <60} {node.ports}")
 
-        for u, univ in client.universes.items():
+        for univ in client.universes.values():
             print(f" {univ} pubs:{univ.publishers} subs:{univ.subscribers}")
             print(univ.publisherseq)
 

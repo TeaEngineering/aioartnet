@@ -6,8 +6,9 @@ from aioartnet import (
     DMX_UNIVERSE_SIZE,
 )
 
-from aioartnet.aio_artnet import ArtNetClientProtocol
+from aioartnet.aio_artnet import ArtNetClientProtocol, DGAddr
 
+from asyncio import BaseTransport
 
 from typing import Iterator, Tuple, Any
 import pytest
@@ -48,14 +49,14 @@ def packet_reader(file: str) -> Iterator[Tuple[float, bytes]]:
             yield time, packet
 
 
-class MockTransport:
-    def __init__(self):
-        self.sent = []
+class MockTransport(BaseTransport):
+    def __init__(self) -> None:
+        self.sent: list[tuple[bytes, DGAddr]] = []
 
-    def get_extra_info(self, key: str) -> Any:
+    def get_extra_info(self, name: str, default: Any = None) -> Any:
         return None
 
-    def sendto(self, data, addr=None):
+    def sendto(self, data: bytes, addr: DGAddr) -> None:
         self.sent.append((data, addr))
 
 
@@ -96,10 +97,10 @@ def test_artnet_poll_reply() -> None:
     assert client.universes[8].last_data[0] == 0
     assert client.universes[8].last_data[1] == 0x70
     assert client.universes[8].last_data[2] == 0x94
-    assert client.universes[8].publisherseq == {("192.168.1.205", 0): 20}
+    assert client.universes[8].publisherseq == {(("192.168.1.205", 6454), 0): 20}
 
     assert client.universes[2].last_data[1] == 0
-    assert client.universes[2].publisherseq == {("192.168.1.205", 0): 85}
+    assert client.universes[2].publisherseq == {(("192.168.1.205", 6454), 0): 85}
 
     # DMX Monitor for iPhone binds from page 1, identifies as a desk
     assert client.nodes[3724650688]._portBinds == {1: []}
@@ -137,20 +138,20 @@ def test_artnet_poll_reply() -> None:
 # that a real network is not.
 #  ie. a send can trigger a rx that triggers a send that arrives in the
 #    middle of the original send. normally event loops don't do this.
-class BroadcastTransport:
-    def __init__(self, protocols=[]) -> None:
+class BroadcastTransport(BaseTransport):
+    def __init__(self, protocols: list[ArtNetClientProtocol] = []) -> None:
         self.protos = list(protocols)
         self.pending: deque[Tuple[bytes, Any]] = deque()
         for p in self.protos:
             p.connection_made(self)
 
-    def connect_protocol(self, protocol) -> None:
+    def connect_protocol(self, protocol: ArtNetClientProtocol) -> None:
         self.protos.append(protocol)
 
-    def get_extra_info(self, key: str) -> Any:
+    def get_extra_info(self, name: str, default: Any = None) -> Any:
         return None
 
-    def sendto(self, data, addr=None) -> None:
+    def sendto(self, data: bytes, addr: DGAddr) -> None:
         self.pending.append((data, addr))
 
     def drain(self) -> None:
@@ -161,7 +162,7 @@ class BroadcastTransport:
 
 
 @pytest.mark.asyncio
-async def test_artnet_back_to_back_nodes():
+async def test_artnet_back_to_back_nodes() -> None:
     # use two instances of our client linked by a mock transport to test
     # port and node detection
 
@@ -204,7 +205,7 @@ async def test_artnet_back_to_back_nodes():
 
 
 @pytest.mark.asyncio
-async def test_ports():
+async def test_ports() -> None:
     # use one instance of client with a mock loopback transport to test
     # port and node detection
 
@@ -246,7 +247,7 @@ async def test_ports():
 
 
 @pytest.mark.asyncio
-async def test_dmx_tx_rx():
+async def test_dmx_tx_rx() -> None:
     # use two instances of our client linked by a mock transport to test
     # port and node detection
 
