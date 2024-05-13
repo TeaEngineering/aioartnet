@@ -1,19 +1,17 @@
+import socket
 import struct
+from asyncio import BaseTransport
+from collections import deque
+from typing import Any, Iterator, Tuple
+
+import pytest
 
 from aioartnet import (
-    ArtNetUniverse,
-    ArtNetClient,
     DMX_UNIVERSE_SIZE,
+    ArtNetClient,
+    ArtNetUniverse,
 )
-
 from aioartnet.aio_artnet import ArtNetClientProtocol, DGAddr
-
-from asyncio import BaseTransport
-
-from typing import Iterator, Tuple, Any
-import pytest
-import socket
-from collections import deque
 
 
 def test_universe() -> None:

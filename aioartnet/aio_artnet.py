@@ -1,14 +1,13 @@
 import asyncio
+import fcntl
+import ipaddress
+import logging
+import re
 import socket
 import struct
-import ipaddress
-import fcntl
-import logging
-from typing import Optional, Tuple, Any, cast, Union
-import re
 import time
 from collections import defaultdict
-
+from typing import Any, Optional, Tuple, Union, cast
 
 # Art-Net implementation for Python asyncio
 # Any page references to 'spec' refer to
