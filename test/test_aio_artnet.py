@@ -1,11 +1,14 @@
 import struct
 
-from aio_artnet import (
+from aioartnet import (
     ArtNetUniverse,
     ArtNetClient,
-    ArtNetClientProtocol,
     DMX_UNIVERSE_SIZE,
 )
+
+from aioartnet.aio_artnet import ArtNetClientProtocol
+
+
 from typing import Iterator, Tuple, Any
 import pytest
 import socket
@@ -67,7 +70,7 @@ def test_artnet_poll_reply() -> None:
     transport = MockTransport()
     proto.connection_made(transport)
 
-    for _, pkt in packet_reader("tests/artnet-nodes.pcap"):
+    for _, pkt in packet_reader("test/artnet-nodes.pcap"):
         udp = pkt[42:]
         ip = socket.inet_ntoa(pkt[26:30])
         (port,) = struct.unpack(">H", pkt[34:36])

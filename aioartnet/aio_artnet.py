@@ -9,10 +9,6 @@ import re
 import time
 from collections import defaultdict
 
-from desk import (
-    ControllerUniverseOutput,
-    Controller,
-)
 
 # Art-Net implementation for Python asyncio
 # Any page references to 'spec' refer to
@@ -64,10 +60,10 @@ def swap16(x: int) -> int:
 # Art-Net II switched over to UDP unicast from the universe publisher to
 # the subscriber(s).
 
-# We enumerate all universes offered by all nodes and offer them to the controller,
-# merged by the 15-bit universe identifier. The controller can make a call to
-# subscribe, write, or broadcast each universe key, and we will manage the
-# art-poll-reply flags to make this work.
+# We enumerate all universes offered by all nodes and offer them
+# merged by the 15-bit universe identifier. Controlling code can make a call to
+# set_port_config to subscribe, write, or broadcast each universe, and we will
+# manage the art-poll-reply flags to make this work.
 #
 # We might recieved unsolicited broadcasts of a universe from other controllers,
 # (like QLC+) there's nothing we can do about this, but we drop them unless we
@@ -76,8 +72,6 @@ def swap16(x: int) -> int:
 # Each Node can publish one (artnet<3) or more (arcnet>3) sets of 4-ports.
 # Each set fixes a single net and sub_net value, however the choice
 # of universe nibble is determined per-port (net:sub_net:universe).
-# TODO: implement multiple pages (ArtFor now I have will implement a single
-
 
 class ArtNetNode:
     def __init__(
@@ -456,12 +450,11 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
 UniverseKey = int | str | ArtNetUniverse
 
 
-class ArtNetClient(ControllerUniverseOutput):
+class ArtNetClient():
     def __init__(
         self, interface=None, net=0, subnet=0, passive=False, portName="aioartnet"
     ) -> None:
         self.nodes: dict[int, ArtNetNode] = {}
-        self.controller: Optional[Controller] = None
         self.universes: dict[int, ArtNetUniverse] = {}
         self.net = 0
         self.subnet = 0
@@ -480,7 +473,7 @@ class ArtNetClient(ControllerUniverseOutput):
             interface = get_preferred_artnet_interface()
         self.interface = interface
 
-    async def connect(self, controller: Controller) -> asyncio.Future:
+    async def connect(self) -> asyncio.Future:
         loop = asyncio.get_running_loop()
 
         on_con_lost = loop.create_future()
@@ -508,7 +501,6 @@ class ArtNetClient(ControllerUniverseOutput):
             asyncio.create_task(protocol.art_poll_task())
 
         self.transport = transport
-        self.controller = controller
 
         return on_con_lost
 
@@ -530,8 +522,6 @@ class ArtNetClient(ControllerUniverseOutput):
 
     def add_node(self, ip: int, node: ArtNetNode):
         self.nodes[ip] = node
-        if self.controller:
-            self.controller.add_node(node)
 
     def _parse_universe(self, universe: UniverseKey) -> int:
         if isinstance(universe, str):
@@ -677,9 +667,6 @@ def get_preferred_artnet_interface() -> str:
 async def main():
     client = ArtNetClient()
     await client.connect(None)
-    # print(await client.get_dmx(universe=1))
-    # print(await client.set_dmx(universe=1, data=b"\0\0\0\0"))
-
     u = client.set_port_config("0:0:1", isinput=True)
     u.last_data[0:100] = range(100)
 
