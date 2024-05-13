@@ -11,10 +11,7 @@ from collections import defaultdict
 
 from desk import (
     ControllerUniverseOutput,
-    NetNode,
     Controller,
-    UniverseKey,
-    DMX_UNIVERSE_SIZE,
 )
 
 # Art-Net implementation for Python asyncio
@@ -27,6 +24,8 @@ from desk import (
 # Art-Net specific constants
 ARTNET_PORT = 6454
 ARTNET_PREFIX = bytes("Art-Net".encode() + b"\000")
+
+DMX_UNIVERSE_SIZE = 512
 
 # We need to interrogate network interfaces to check which are configured for IP and
 # have a valid broadcast address. For unix-like systems this is fone with socket fnctl
@@ -83,15 +82,17 @@ def swap16(x: int) -> int:
 class ArtNetNode:
     def __init__(
         self,
-        longName: str = "name",
-        portName: str = "",
-        address: str = "",
-        style: int = 0,
+        longName: str,
+        portName: str,
+        address: str,
+        style: int,
+        addr: tuple[str, int],
     ) -> None:
         self.portName = portName
         self.longName = longName
         self.address = address
         self._portBinds: defaultdict[int, list[ArtNetPort]] = defaultdict(list)
+        self._addr = addr
         self.ports: list[ArtNetPort] = []
         self.style: int = style
         self.last_reply: float = 0.0
@@ -108,7 +109,8 @@ class ArtNetUniverse:
         self.publishers: list[ArtNetNode] = list()
         self.subscribers: list[ArtNetNode] = list()
         self.last_data = bytearray(DMX_UNIVERSE_SIZE)
-        self.last_seq = 0
+        self._last_seq = 1
+        self._last_publish: float = 0.0
         self.publisherseq: dict[Tuple[int, int], int] = {}
 
     def split(self) -> Tuple[int, int, int]:
@@ -183,7 +185,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         logger.info(
             f"Received Art-Net Poll: ver {ver} flags {flags} prio: {priority} from {addr}"
         )
-        self.send_art_poll_reply(addr)
+        self.send_art_poll_reply()
 
     def on_art_poll_reply(self, addr, data: bytes) -> None:
         # everything up to the mac address field is mandatory, the rest must be
@@ -193,30 +195,30 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         longName, report, numports = struct.unpack("<64s64sH", data[34:164])
         ptype, ins, outs, swin, swout = struct.unpack("<4s4s4s4s4s", data[164:184])
         acnprio, swmacro, swremote, style = struct.unpack("<BBB3xB", data[184:191])
-        mac = struct.unpack("<6s", data[191:197])
+        # mac = struct.unpack("<6s", data[191:197])
 
         bindip = 0
         bindindex = 0
         status2 = 0
         goodout = bytes(4)
         status3 = 0
-        rdm = bytes(6)
+        # rdm = bytes(6)
         user = 0
         refresh = 0
         if len(data) >= 202:
             bindip, bindindex = struct.unpack("<IB", data[197:202])
         if len(data) >= 203:
-            status2 = struct.unpack("<B", data[202:203])
+            (status2,) = struct.unpack("<B", data[202:203])
         if len(data) >= 207:
-            goodout = struct.unpack("<4s", data[203:207])
+            (goodout,) = struct.unpack("<4s", data[203:207])
         if len(data) >= 208:
-            status3 = struct.unpack("<B", data[207:208])
+            (status3,) = struct.unpack("<B", data[207:208])
         if len(data) >= 216:
-            rdm = struct.unpack("<6s", data[210:216])
+            (rdm,) = struct.unpack("<6s", data[210:216])
         if len(data) >= 218:
-            user = struct.unpack("<H", data[216:218])
+            (user,) = struct.unpack("<H", data[216:218])
         if len(data) >= 220:
-            refresh = struct.unpack("<H", data[218:220])
+            (refresh,) = struct.unpack("<H", data[218:220])
 
         # post process
         portName = portName.rstrip(b"\000").decode()
@@ -232,12 +234,15 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             changed |= nn.style != style
             logger.debug(f"change detection on {nn} => {changed}")
 
+        # FIXME: what if a node changes ip address?
+
         if nn is None or changed:
             newnode = ArtNetNode(
                 address=f"{ipa}:{port}",
                 longName=longName,
                 portName=portName,
                 style=style,
+                addr=addr,
             )
             if changed:
                 logger.debug(f"change detected: from {nn} to {newnode}")
@@ -326,20 +331,35 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
 
     async def art_poll_task(self):
         while True:
-            await asyncio.sleep(3)
-            self._send_art_poll()
+            await asyncio.sleep(0.1)
+            t = time.time()
 
-    def _send_art_poll(self):
+            for u in self.client._publishing:
+                if t > u._last_publish + 1.0:
+                    self._send_art_dmx(u)
+
+            if t > self._last_poll + 2.0:
+                self._send_art_poll()
+
+    def _send_art_poll(self) -> None:
+        self._last_poll = time.time()
         message = ARTNET_PREFIX + struct.pack("<HBBBB", 0x2000, 0, 14, 6, 16)
         logger.debug(f"sending poll to {self.client.broadcast_ip}")
         self.transport.sendto(message, addr=(self.client.broadcast_ip, ARTNET_PORT))
 
-    def send_art_poll_reply(self, addr) -> None:
+    def _send_art_dmx(self, u: ArtNetUniverse) -> None:
+        u._last_publish = time.time()
+        u._last_seq = 1 + ((u._last_seq + 1) % 255)
+        logger.debug(f"send_art_dmx {u} to {u.subscribers}")
+        for s in u.subscribers:
+            self._send_art_dmx_subscriber(u, s, u._last_seq)
+
+    def send_art_poll_reply(self) -> None:
         for bi, p in self.client._portBinds.items():
-            self._send_art_poll_reply_bindindex(addr, bi, p)
+            self._send_art_poll_reply_bindindex(bi, p)
 
     def _send_art_poll_reply_bindindex(
-        self, addr, bindindex: int, ports: list[ArtNetPort]
+        self, bindindex: int, ports: list[ArtNetPort]
     ) -> None:
         bindindex = 1
         ip = int.from_bytes(
@@ -350,7 +370,6 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         esta = 0x02AE
         status2 = 0x08  # 15-bit port-address supported
         status3 = 0
-        rdm = 0
         user = 0
         refresh = 40
 
@@ -409,15 +428,32 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             user,
             refresh,
         )
+        addr = (self.client.broadcast_ip, ARTNET_PORT)
         logger.debug(f"sending poll reply to {addr}")
         if self.transport:
-            self.transport.sendto(data, addr=(self.client.broadcast_ip, ARTNET_PORT))
+            self.transport.sendto(data, addr=addr)
+
+    def _send_art_dmx_subscriber(
+        self, universe: ArtNetUniverse, node: ArtNetNode, seq: int
+    ) -> None:
+        subuni = universe.portaddress & 0xFF
+        net = universe.portaddress >> 8
+        message = ARTNET_PREFIX + struct.pack(
+            "<HBBBBBBH", 0x5000, 0, 14, seq, 0, subuni, net, swap16(DMX_UNIVERSE_SIZE)
+        )
+        message = message + universe.last_data
+
+        logger.info(f"sending dmx for {universe} to {node} at {node._addr}")
+        self.transport.sendto(message, addr=node._addr)
 
     def error_received(self, exc):
         logger.warn("Error received:", exc)
 
     def connection_lost(self, exc):
         logger.warn("Connection closed")
+
+
+UniverseKey = int | str | ArtNetUniverse
 
 
 class ArtNetClient(ControllerUniverseOutput):
@@ -436,10 +472,10 @@ class ArtNetClient(ControllerUniverseOutput):
         # identify as an StController, see Table 4 'Style Codes' p23
         self._style = 1
         self.passive = passive
-        self.broadcast_ip = None
-        self.unicast_ip = None
+        self.broadcast_ip: Optional[str] = None
+        self.unicast_ip: Optional[str] = None
         self.protocol: Optional[ArtNetClientProtocol] = None
-
+        self._publishing: list[ArtNetUniverse] = []
         if interface is None:
             interface = get_preferred_artnet_interface()
         self.interface = interface
@@ -456,9 +492,10 @@ class ArtNetClient(ControllerUniverseOutput):
             bcast = fcntl.ioctl(s.fileno(), SIOCGIFBRDADDR, iface_bin)[20:24]
             self.broadcast_ip = socket.inet_ntoa(bcast)
             self.unicast_ip = socket.inet_ntoa(packet_ip)
-            logger.info(
-                f"using interface {self.interface} with ip {self.unicast_ip} broadcast ip {self.broadcast_ip}"
-            )
+
+        logger.info(
+            f"using interface {self.interface} with ip {self.unicast_ip} broadcast ip {self.broadcast_ip}"
+        )
 
         # remote_addr=('192.168.1.255', ARTNET_PORT),
         transport, protocol = await loop.create_datagram_endpoint(
@@ -476,9 +513,19 @@ class ArtNetClient(ControllerUniverseOutput):
         return on_con_lost
 
     async def set_dmx(self, universe: UniverseKey, data: bytes):
-        pass
+        port_addr = self._parse_universe(universe)
 
-    def get_nodes(self) -> list[NetNode]:
+        # where to keep our write buffer?
+        u = self._get_create_universe(port_addr)
+
+        if u not in self._publishing:
+            raise ValueError(f"No input port configured for {u}")
+
+        u.last_data[:] = data[:]
+        if self.protocol:
+            self.protocol._send_art_dmx(u)
+
+    def get_nodes(self) -> list[ArtNetNode]:
         return list(self.nodes.values())
 
     def add_node(self, ip: int, node: ArtNetNode):
@@ -486,18 +533,24 @@ class ArtNetClient(ControllerUniverseOutput):
         if self.controller:
             self.controller.add_node(node)
 
-    def set_port_config(
-        self, universe: UniverseKey, isinput=False, isoutput=False
-    ) -> ArtNetUniverse:
-        port_addr = 0
+    def _parse_universe(self, universe: UniverseKey) -> int:
         if isinstance(universe, str):
             # parse to int
             net, sub, univ = map(int, universe.split(":"))
-            port_addr = ((net & 0x7F) << 8) + ((sub & 0x0F) << 4) + (univ & 0x0F)
+            return ((net & 0x7F) << 8) + ((sub & 0x0F) << 4) + (univ & 0x0F)
         elif isinstance(universe, int):
-            port_addr = universe
+            if universe > 0x7FFF:
+                raise ValueError(f"invalid universe: {universe} exceeds 0x7fff")
+            return universe
+        elif isinstance(universe, ArtNetUniverse):
+            return universe.portaddress
         else:
-            raise ValueError("invalid universe")
+            raise ValueError(f"invalid universe: {universe}")
+
+    def set_port_config(
+        self, universe: UniverseKey, isinput=False, isoutput=False
+    ) -> ArtNetUniverse:
+        port_addr = self._parse_universe(universe)
 
         u = self._get_create_universe(port_addr)
 
@@ -527,8 +580,14 @@ class ArtNetClient(ControllerUniverseOutput):
         else:
             self._portBinds = {1: []}
 
+        # used for the timer-based DMX repeating
+        if u in self._publishing:
+            self._publishing.remove(u)
+        if isinput:
+            self._publishing.append(u)
+
         if not self.passive and self.protocol:
-            self.protocol._send_art_poll()
+            self.protocol.send_art_poll_reply()
 
         return u
 
@@ -549,7 +608,7 @@ class ArtNetClient(ControllerUniverseOutput):
     def portName(self, value: str) -> None:
         self._portName = value
         if not self.passive and self.protocol:
-            self.protocol._send_art_poll()
+            self.protocol.send_art_poll_reply()
 
     @property
     def longName(self):
@@ -559,7 +618,7 @@ class ArtNetClient(ControllerUniverseOutput):
     def longName(self, value: str) -> None:
         self._longName = value
         if not self.passive and self.protocol:
-            self.protocol._send_art_poll()
+            self.protocol.send_art_poll_reply()
 
     @property
     def style(self):
@@ -569,7 +628,7 @@ class ArtNetClient(ControllerUniverseOutput):
     def style(self, value: int) -> None:
         self._style = value
         if not self.passive and self.protocol:
-            self.protocol._send_art_poll()
+            self.protocol.send_art_poll_reply()
 
 
 def get_iface_ip(iface: str):
@@ -637,6 +696,7 @@ async def main():
             print(univ.publisherseq)
 
         print(u2.last_data[0:20])
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

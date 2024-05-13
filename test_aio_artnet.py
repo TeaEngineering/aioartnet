@@ -1,6 +1,11 @@
 import struct
 
-from aio_artnet import ArtNetUniverse, ArtNetClient, ArtNetClientProtocol
+from aio_artnet import (
+    ArtNetUniverse,
+    ArtNetClient,
+    ArtNetClientProtocol,
+    DMX_UNIVERSE_SIZE,
+)
 from typing import Iterator, Tuple, Any
 import pytest
 import socket
@@ -132,7 +137,9 @@ def test_artnet_poll_reply() -> None:
 class BroadcastTransport:
     def __init__(self, protocols=[]) -> None:
         self.protos = list(protocols)
-        self.pending: deque[Tuple[bytes,Any]] = deque()
+        self.pending: deque[Tuple[bytes, Any]] = deque()
+        for p in self.protos:
+            p.connection_made(self)
 
     def connect_protocol(self, protocol) -> None:
         self.protos.append(protocol)
@@ -165,11 +172,7 @@ async def test_artnet_back_to_back_nodes():
 
     protoA = ArtNetClientProtocol(clA)
     protoB = ArtNetClientProtocol(clB)
-
     transport = BroadcastTransport([protoA, protoB])
-
-    protoA.connection_made(transport)
-    protoB.connection_made(transport)
 
     # send, then flush the poll/reply packets
     protoA._send_art_poll()
@@ -205,12 +208,10 @@ async def test_ports():
     clA = ArtNetClient(interface="dummy", portName="alpha")
     clA.broadcast_ip = "10.10.10.255"
     clA.unicast_ip = "10.10.10.10"
-    u = clA.set_port_config("1:0:7", isinput=True)
+    clA.set_port_config("1:0:7", isinput=True)
 
     protoA = ArtNetClientProtocol(clA)
-
     transport = BroadcastTransport([protoA])
-    protoA.connection_made(transport)
 
     # send, then flush the poll/reply packets
     protoA._send_art_poll()
@@ -227,8 +228,8 @@ async def test_ports():
     assert clA.universes[263].subscribers == []
 
     # disable existing, add an output port
-    u = clA.set_port_config("1:0:7")
-    u = clA.set_port_config("0:1:8", isoutput=True)
+    clA.set_port_config("1:0:7")
+    clA.set_port_config("0:1:8", isoutput=True)
 
     transport.drain()
     assert str(clA._portBinds) == "{1: [Port<Output,DMX,0:1:8>]}"
@@ -239,3 +240,37 @@ async def test_ports():
     print(clA.universes)
     assert clA.universes[24].publishers == []
     assert str(clA.universes[24].subscribers) == "[ArtNetNode<alpha,10.10.10.10:6454>]"
+
+
+@pytest.mark.asyncio
+async def test_dmx_tx_rx():
+    # use two instances of our client linked by a mock transport to test
+    # port and node detection
+
+    clA = ArtNetClient(interface="dummy", portName="alpha")
+    clA.broadcast_ip = "10.10.10.255"
+    clA.unicast_ip = "10.10.10.10"
+
+    clB = ArtNetClient(interface="dummy", portName="bravo")
+    clB.broadcast_ip = "10.10.10.255"
+    clB.unicast_ip = "10.10.10.2"
+
+    protoA = ArtNetClientProtocol(clA)
+    protoB = ArtNetClientProtocol(clB)
+    transport = BroadcastTransport([protoA, protoB])
+
+    utx = clA.set_port_config("1:0:7", isinput=True)
+    urx = clB.set_port_config("1:0:7", isoutput=True)
+
+    assert urx.last_data == bytes(DMX_UNIVERSE_SIZE)
+
+    # send, then flush the poll/reply packets
+    protoA._send_art_poll()
+    transport.drain()
+
+    test_pattern = bytes(list(range(128)) * 4)
+    await clA.set_dmx(utx, test_pattern)
+    assert len(transport.pending) == 1
+    transport.drain()
+
+    assert urx.last_data == test_pattern
