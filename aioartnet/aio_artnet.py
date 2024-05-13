@@ -358,7 +358,6 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
     def _send_art_poll_reply_bindindex(
         self, bindindex: int, ports: list[ArtNetPort]
     ) -> None:
-        bindindex = 1
         if not self.client.unicast_ip:
             return
         ip = int.from_bytes(

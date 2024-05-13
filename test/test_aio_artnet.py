@@ -243,6 +243,14 @@ async def test_ports() -> None:
     assert clA.universes[24].publishers == []
     assert str(clA.universes[24].subscribers) == "[ArtNetNode<alpha,10.10.10.10:6454>]"
 
+    # two ports active at once
+    clA.set_port_config("0:1:9", isinput=True)
+    transport.drain()
+    assert clA.universes[24].publishers == []
+    assert str(clA.universes[24].subscribers) == "[ArtNetNode<alpha,10.10.10.10:6454>]"
+    assert str(clA.universes[25].publishers) == "[ArtNetNode<alpha,10.10.10.10:6454>]"
+    assert str(clA.universes[25].subscribers) == "[]"
+
 
 @pytest.mark.asyncio
 async def test_dmx_tx_rx() -> None:
