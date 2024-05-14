@@ -65,4 +65,8 @@ Implemented Messages
 | RDM ArtTodRequest / ArtTodData / ArtTodControl / ArtRdm / ArtRdmSub /
 
 
+Arc-Net Boilerplate
+----
+
+This application aims to be compatible with Art-Net™ Designed by and Copyright Artistic Licence Engineering Ltd.
 
