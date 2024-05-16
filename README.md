@@ -8,7 +8,7 @@ This library aims to be simple and robust, and can both input data into Art-Net,
 
 It can also be used __passively__ to build the network model without joining as an Art-Net Node.
 
-We also have a propriety iOS/Xcode component available for commercial licensing that uses the same event driven API as this code.
+We also have a propriety iOS/Xcode component available for commercial licensing that uses the same event driven API as this code. This will be a significantly better starting point for new designs than [libartnet](https://github.com/OpenLightingProject/libartnet) for most projects.
 
 Install
 -----
