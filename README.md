@@ -71,10 +71,15 @@ Implemented Messages
 | RDM ArtTodRequest / ArtTodData / ArtTodControl / ArtRdm / ArtRdmSub | - | - |
 
 
-Art-Net Boilerplate
+Art-Net
 ----
 
-This application aims to be fully compatible with Art-Net devices.
+This application aims to be fully compatible with Art-Net devices. We have tested it with:
 
-Art-Net™ Designed by and Copyright Artistic Licence Engineering Ltd.
-![Art-Net logo](./docs/art-net-master-logo.svg)
+* [QLC+ lighting controller](https://www.qlcplus.org/)
+* [Enttec ODE Mk3](https://www.enttec.com/product/dmx-distribution/ode-mk3-dmx-ethernet-converter/)
+* iOS [DMX Monitor app](https://apps.apple.com/us/app/dmx-monitor/id1544911427)
+* Many other iOS apps
+
+
+![Art-Net logo](./docs/art-net-master-logo.svg) Art-Net™ Designed by and Copyright Artistic Licence Engineering Ltd.
