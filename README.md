@@ -2,7 +2,7 @@
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/TeaEngineering/aioartnet/check.yml) ![PyPI version](https://badge.fury.io/py/aioartnet.svg)
 
 
-**aioartnet** is a pure python asyncio connector for the [royalty-free Art-Net protocol](https://art-net.org.uk/background/), which is a transport to transmit and recieve the [DMX-512 lighting control protocol](https://en.wikipedia.org/wiki/DMX512) over Ethernet (UDP). The protocol is the modern standard for interconnecting complex lighting fixtures directly, and for branching out individual universes for a specific local area to control classic DMX-512 interlinked fixtures. Both open and propriety lighting control systems can emit Art-Net directly.
+**aioartnet** is a pure python asyncio connector for the [royalty-free Art-Net protocol](https://art-net.org.uk/background/), which is a transport to transmit and recieve the [DMX-512 lighting control protocol](https://en.wikipedia.org/wiki/DMX512) over Ethernet (UDP). The protocol is the modern standard for interconnecting complex lighting fixtures directly, and for branching out individual universes for a specific local area to control classic DMX-512 XLR-cable interlinked fixtures. Both open and propriety lighting control systems can emit Art-Net directly.
 
 This library aims to be simple and robust, and can both input data into Art-Net, as well as output it from "artnet" to your user code. It builds a dynamic model of the network's Art-Net nodes, their ports and the universe(s) of DMX-512 that are being controlled. Fully type hinted to comply with `PEP-561`. No non-core dependancies, with a test suite that runs on Python 3.9 to 3.11.
 
@@ -39,14 +39,18 @@ https://github.com/TeaEngineering/aioartnet/blob/6aa67e1aa9f78924612395306978e31
 Features
 ----
 
-| Message                            | Recieve             | Transmit           |
-|------------------------------------|---------------------|--------------------|
-| 15-bit port addresses              | :heavy_check_mark:  | :heavy_check_mark: |
-| >4 ports (bindIndex)               | :heavy_check_mark:  | :heavy_check_mark: |
-| dynamic reconfigure from software  | :heavy_check_mark:  | :heavy_check_mark: |
-| merge-mode (LTP/HTP) in reciever   | -                   | -                  |
-| RDM commands                       | -                   | -                  |
-
+| Message                                | Recieve             | Transmit           |
+|----------------------------------------|---------------------|--------------------|
+| Node and universe discovery            | :heavy_check_mark:  | :heavy_check_mark: |
+| 15-bit port addresses                  | :heavy_check_mark:  | :heavy_check_mark: |
+| >4 ports (bindIndex) on same IP        | :heavy_check_mark:  | :heavy_check_mark: |
+| merge-mode (LTP/HTP) in reciever       | -                   | -                  |
+| RDM commands to enumerate fixtures     | -                   | -                  |
+| Timecode                               | -                   | -                  |
+| Multi-universe sync message            | -                   | -                  |
+| local node reconfigure by API          | :heavy_check_mark:  | :heavy_check_mark: |
+| remote reconfigure (by ArtAddress etc) | -                   | -                  |
+| Fixture firmware upgrade messages      | Not planned         | Not planned        |
 
 Implemented Messages
 -----
@@ -67,8 +71,10 @@ Implemented Messages
 | RDM ArtTodRequest / ArtTodData / ArtTodControl / ArtRdm / ArtRdmSub | - | - |
 
 
-Arc-Net Boilerplate
+Art-Net Boilerplate
 ----
 
-This application aims to be compatible with Art-Net™ Designed by and Copyright Artistic Licence Engineering Ltd.
+This application aims to be fully compatible with Art-Net devices.
 
+Art-Net™ Designed by and Copyright Artistic Licence Engineering Ltd.
+![Art-Net logo](./docs/art-net-master-logo.svg)
