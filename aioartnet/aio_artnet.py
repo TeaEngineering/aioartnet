@@ -170,10 +170,11 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             if h:
                 h(addr, data[10:])
             else:
-                print(f"Received Art-Net: op {opcode} from {addr}: {data[10:]!r}")
-                raise ValueError(f"missing art-net support for {hex(opcode)}")
+                logger.debug(
+                    f"Received unsupported Art-Net: op {hex(opcode)} from {addr}: {data[10:]!r}"
+                )
         else:
-            print(f"Received non Art-Net data from {addr}: {data!r}")
+            logger.debug(f"Received non Art-Net data from {addr}: {data!r}")
 
     def on_art_poll(self, addr: DGAddr, data: bytes) -> None:
         ver, flags, priority = struct.unpack("<HBB", data)
@@ -293,9 +294,12 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         ver = swap16(ver)
         chlen = swap16(chlen)
         portaddress = sub + (net << 8)
-        print(
-            f"Received Art-Net DMX: ver {ver} port_address {portaddress} seq {seq} channels {chlen} from {addr}"
-        )
+
+        # check enabled flag as a ~40Hz frequency message
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Received Art-Net DMX: ver {ver} port_address {portaddress} seq {seq} channels {chlen} from {addr}"
+            )
         # TODO: should we support overside/undersize universes? For now truncate
         # what is supplied beyond DMX_UNIVERSE_SIZE
         if chlen > DMX_UNIVERSE_SIZE:
@@ -449,7 +453,9 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         logger.warn("Error received:", exc)
 
     def connection_lost(self, exc: Optional[Exception]) -> None:
-        logger.warn("Connection closed")
+        if self.client._task:
+            logger.info("Connection closed, cancelling periodic task")
+            self.client._task.cancel()
 
 
 UniverseKey = Union[int, str, ArtNetUniverse]
@@ -477,42 +483,45 @@ class ArtNetClient:
         self.passive = passive
         self.broadcast_ip: Optional[str] = None
         self.unicast_ip: Optional[str] = None
+        self.listen_ip: str = "0.0.0.0"
         self.protocol: Optional[ArtNetClientProtocol] = None
         self._publishing: list[ArtNetUniverse] = []
-        if interface is None:
-            interface = get_preferred_artnet_interface()
-        self.interface: str = interface
+        self.interface: Optional[str] = interface
+        self._task: Optional[asyncio.Task[None]] = None
 
-    async def connect(self) -> asyncio.Future[None]:
+    async def connect(self) -> asyncio.DatagramTransport:
         loop = asyncio.get_running_loop()
 
-        on_con_lost = loop.create_future()
+        if self.broadcast_ip is None or self.unicast_ip is None:
+            if self.interface is None:
+                self.interface = get_preferred_artnet_interface()
 
-        # lookup broadcast for provided interface
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            iface_bin = struct.pack("256s", bytes(self.interface, "utf-8"))
-            packet_ip = fcntl.ioctl(s.fileno(), SIOCGIFADDR, iface_bin)[20:24]
-            bcast = fcntl.ioctl(s.fileno(), SIOCGIFBRDADDR, iface_bin)[20:24]
-            self.broadcast_ip = socket.inet_ntoa(bcast)
-            self.unicast_ip = socket.inet_ntoa(packet_ip)
+            ips = get_iface_ip(self.interface)
+            if not ips:
+                raise Exception(
+                    f"Unable to determine IPs for interface '{self.interface}'"
+                )
+            self.unicast_ip, _, self.broadcast_ip = ips
 
         logger.info(
-            f"using interface {self.interface} with ip {self.unicast_ip} broadcast ip {self.broadcast_ip}"
+            f"using interface {self.interface} with ip {self.unicast_ip} broadcast ip {self.broadcast_ip}, listening on {self.listen_ip}"
         )
 
-        # remote_addr=('192.168.1.255', ARTNET_PORT),
+        # create_datagram_endpoint only allows us to listen on a single address. Ideally we would listen for packets
+        # sent to both our unicast and the broadcast address. As a workaround we can listen on 0.0.0.0 which will get
+        # us both (however perhaps also those from other interfaces).
         transport, protocol = await loop.create_datagram_endpoint(
             lambda: ArtNetClientProtocol(self),
-            local_addr=("0.0.0.0", ARTNET_PORT),
+            local_addr=(self.listen_ip, ARTNET_PORT),
             family=socket.AF_INET,
             allow_broadcast=True,
         )
         if not self.passive:
-            asyncio.create_task(protocol.art_poll_task())
+            self._task = asyncio.create_task(
+                protocol.art_poll_task(), name="Art-Net timer"
+            )
 
-        self.transport = transport
-
-        return on_con_lost
+        return transport
 
     async def set_dmx(self, universe: UniverseKey, data: bytes) -> None:
         port_addr = self._parse_universe(universe)

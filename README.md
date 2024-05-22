@@ -2,16 +2,16 @@
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/TeaEngineering/aioartnet/check.yml) ![PyPI version](https://badge.fury.io/py/aioartnet.svg)
 
 
-**aioartnet** is a pure python asyncio connector for the [royalty-free Art-Net protocol](https://art-net.org.uk/background/), which is a transport to transmit and recieve the [DMX-512 lighting control protocol](https://en.wikipedia.org/wiki/DMX512) over Ethernet (UDP). The protocol is the modern standard for interconnecting complex lighting fixtures directly, and for branching out individual universes for a specific local area to control classic DMX-512 XLR-cable interlinked fixtures. Both open and propriety lighting control systems can emit Art-Net directly.
+**aioartnet** is a pure python [asyncio connector](https://docs.python.org/3/library/asyncio.html) for the [royalty-free Art-Net protocol](https://art-net.org.uk/background/), which is a transport to transmit and recieve the [DMX-512 lighting control protocol](https://en.wikipedia.org/wiki/DMX512) over Ethernet (UDP). The protocol is the modern standard for interconnecting complex lighting fixtures directly, and for branching out individual universes for a specific local area to control classic DMX-512 XLR-cable interlinked fixtures. Both open and propriety lighting control systems can emit Art-Net directly.
 
 This library aims to be simple and robust, and can both input data into Art-Net, as well as output it from "artnet" to your user code. It builds a dynamic model of the network's Art-Net nodes, their ports and the universe(s) of DMX-512 that are being controlled. Fully type hinted to comply with `PEP-561`. No non-core dependancies, with a test suite that runs on Python 3.9 to 3.11.
 
 It can also be used __passively__ to build the network model without joining as an Art-Net Node.
 
-We also have a propriety iOS/Xcode component available for commercial licensing that uses the same event driven API as this code. This will be a significantly better starting point for new designs than [libartnet](https://github.com/OpenLightingProject/libartnet) for most projects.
+We also have a propriety iOS/Xcode component available for commercial licensing that uses the same event driven API as this code, built on top of Apple's Networking framework `NWProtocolUDP`. This will be a significantly better starting point for new designs than [libartnet](https://github.com/OpenLightingProject/libartnet) for most projects.
 
-Install
------
+Install & Demo
+====
 
 Use `pip` to install [the package from pypi](https://pypi.org/project/aioartnet/):
 
@@ -31,13 +31,67 @@ Use `pip` to install [the package from pypi](https://pypi.org/project/aioartnet/
 
 
 Getting Started
------
+====
 
-https://github.com/TeaEngineering/aioartnet/blob/6aa67e1aa9f78924612395306978e31ab032321e/aioartnet/aio_artnet.py#L667-L691
+1) Import the library and create an `ArtNetClient`
+```python
+    from aioartnet import ArtNetClient
+    client = ArtNetClient()
+```
+2) Configure the desired input/output ports on the client using `set_port_config()`, each call returns `ArtNetUniverse` objects. Use these to optionally set the initial published value of universes set as ArtNet inputs:
+```python
+    u1 = client.set_port_config("0:0:1", isinput=True)
+    u5 = client.set_port_config("0:0:5", isoutput=True)
+    u1.last_data[:] = list(range(128))*4
+```
+
+3) Await the co-routine `client.connect()` from an asyncio asynchronous context, e.g:
+```python
+    async def main() -> None:
+        client = ArtNetClient()
+        u1 = client.set_port_config("0:0:1", isinput=True)
+        u5 = client.set_port_config("0:0:5", isoutput=True)
+        u1.last_data[:] = list(range(128))*4
+        await client.connect()
+
+    if __name__ == "__main__":
+        logging.basicConfig(level=logging.INFO)
+        asyncio.run(main())
+        asyncio.get_event_loop().run_forever()
+```
+
+4) Once the client is connected, you can add/configure further ports, read the universes of DMX data and change published values.
+
+5) The return value from `client.connect()` is an `ayncio.DatagramTransport`. If you call `close()` on this transport, the periodic task is also cancelled.
+
+
+Networking
+----
+
+There are three ways to configure the networking:
+
+### Automatically
+
+Creating an `ArtNetClient` with no arguments will perform discovery during `connect()` by iterating the interfaces available, checking if they have an IPV4 address (ie. `AF_INET` family) and prefering certain properties. Specifically we prefer `2.x.x.x` subnets with the `255.0.0.0` subnet mask, then configured Ethernet (interface name `enp*`), then configured WiFi interfaces (`wlp*`), followed by any other remaining `AF_INET` interfaces. The priority ordering is set by `aioartnet.PREFERED_INTERFACES_ORDER` which can be monkey-patched if required.
+
+### Manually by specifying an interface
+
+Passing an interface name to the constructor `ArtNetClient(interface="en0")`, or setting `client.interface="en0"` before calling `connect()` will force use of a specific interface, skipping the interface selection logic. The interface is then queried to determine the ip, broadcast and listening address to use using `ioctl` calls.
+
+### Manually by specifying unicast and broadcast IPs
+
+If the two required IP addresses (ours, broadcast) are set manually on the client no discovery is performed. This will be the most portable method as we effectively supply the arguments directly to asyncio.
+
+```python
+client = ArtNetClient()
+client.unicast_ip = '192.168.1.15'
+client.broadcast_ip = '192.168.1.255'
+await client.connect()
+```
 
 
 Features
-----
+====
 
 | Message                                | Recieve             | Transmit           |
 |----------------------------------------|---------------------|--------------------|

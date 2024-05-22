@@ -1,29 +1,44 @@
+import argparse
 import asyncio
 import logging
 
 from . import ArtNetClient
 
 
-async def main() -> None:
-    client = ArtNetClient()
+async def main(client: ArtNetClient) -> None:
     await client.connect()
-    u = client.set_port_config("0:0:1", isinput=True)
-    u.last_data[0:100] = range(100)
-    u2 = client.set_port_config("0:0:5", isoutput=True)
+    u1 = client.set_port_config("0:0:1", isinput=True)
+    u5 = client.set_port_config("0:0:5", isoutput=True)
+    u1.last_data[:] = list(range(128)) * 4
 
     while True:
         await asyncio.sleep(5)
-        print("status:")
+        print("nodes:")
         for n, node in client.nodes.items():
             print(f" {node!r: <60} {node.ports}")
-
+        print("universes:")
         for univ in client.universes.values():
             print(f" {univ} pubs:{univ.publishers} subs:{univ.subscribers}")
 
-        print(u2.last_data[0:20])
+        print(u5.last_data[0:20].hex())
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(
+        prog="aioartnet cli",
+        description="View Art-Net nodes and universes",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("-i", "--interface")
+    args = parser.parse_args()
+
+    level = {False: logging.INFO, True: logging.DEBUG}[args.verbose]
+    logging.basicConfig(level=level)
+
+    kwargs = {}
+    if args.interface:
+        kwargs["interface"] = args.interface
+    client = ArtNetClient(**kwargs)
+
+    asyncio.run(main(client))
     asyncio.get_event_loop().run_forever()
