@@ -26,14 +26,16 @@ if platform == "linux" or platform == "linux2":
             ('sa_data', ctypes.c_uint8 * (2+4+16))
         ]
     ipv4_addr_data_offset = 2
+    AF_PACKET = socket.AF_PACKET
 elif platform == "darwin":
     class Sockaddr(Structure):
         _fields_ = [
             ("sa_len", c_uint8),
             ("sa_family", c_uint8),
-            ("sa_data", c_uint8*14),
+            ("sa_data", c_uint8*24),
         ]
     ipv4_addr_data_offset = 2
+    AF_PACKET = 17
 else:
     raise ValueError("Unsupported platform")
 
@@ -82,9 +84,9 @@ def getifaddrs(ifname: Optional[str]=None, family: Optional[int]=None):
             d['netmask'] = socket.inet_ntoa(netmask[2:6])
             d['broadaddr'] = socket.inet_ntoa(broadaddr[2:6])
         elif fam == socket.AF_INET6:
-            d['addr'] = socket.inet_ntop(fam, addr[6:])
-            d['netmask'] = socket.inet_ntop(fam, netmask[6:])
-        elif fam == socket.AF_PACKET:
+            d['addr'] = socket.inet_ntop(fam, addr[6:22])
+            d['netmask'] = socket.inet_ntop(fam, netmask[6:22])
+        elif fam == AF_PACKET:
             d['addr'] = addr[10:16].hex()
             d['broadaddr'] = broadaddr[10:16].hex()
         logging.debug(f"getifaddrs {d}")
