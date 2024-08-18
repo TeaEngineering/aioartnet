@@ -14,7 +14,7 @@ from ctypes import (
     pointer,
 )
 from sys import platform
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 # return MAC addresses under our own constant, because
 # on macos socket.AF_PACKET is not defined, and the value
@@ -33,7 +33,7 @@ if platform == "linux" or platform == "linux2":
 
 elif platform == "darwin":
 
-    class Sockaddr(Structure):
+    class Sockaddr(Structure):  # type: ignore [no-redef]
         _fields_ = [
             ("sa_len", c_uint8),
             ("sa_family", c_uint8),
@@ -60,7 +60,9 @@ Ifaddrs._fields_ = [
 ]
 
 
-def getifaddrs(ifname: Optional[str] = None, family: Optional[int] = None):
+def getifaddrs(
+    ifname: Optional[str] = None, family: Optional[int] = None
+) -> List[Dict[str, Any]]:
     libc = CDLL(
         ctypes.util.find_library("socket" if os.uname()[0] == "SunOS" else "c"),
         use_errno=True,
@@ -87,18 +89,26 @@ def getifaddrs(ifname: Optional[str] = None, family: Optional[int] = None):
             addr = bytes(ifaddr_p.contents.ifa_addr.contents.sa_data)
 
         if fam == socket.AF_INET:
-            d["addr"] = socket.inet_ntoa(addr[2:6])
-            d["netmask"] = socket.inet_ntoa(netmask[2:6])
-            d["broadaddr"] = socket.inet_ntoa(broadaddr[2:6])
+            if addr:
+                d["addr"] = socket.inet_ntoa(addr[2:6])
+            if netmask:
+                d["netmask"] = socket.inet_ntoa(netmask[2:6])
+            if broadaddr:
+                d["broadaddr"] = socket.inet_ntoa(broadaddr[2:6])
         elif fam == socket.AF_INET6:
-            d["addr"] = socket.inet_ntop(fam, addr[6:22])
-            d["netmask"] = socket.inet_ntop(fam, netmask[6:22])
+            if addr:
+                d["addr"] = socket.inet_ntop(fam, addr[6:22])
+            if netmask:
+                d["netmask"] = socket.inet_ntop(fam, netmask[6:22])
         elif fam == 17:  # linux MAC addr
-            d["addr"] = addr[10:16].hex()
-            d["broadaddr"] = broadaddr[10:16].hex()
+            if addr:
+                d["addr"] = addr[10:16].hex()
+            if broadaddr:
+                d["broadaddr"] = broadaddr[10:16].hex()
             fam = AF_PACKET
         elif fam == 18:  # macos MAC addr
-            d["addr"] = addr[9:15].hex()
+            if addr:
+                d["addr"] = addr[9:15].hex()
             fam = AF_PACKET
         logging.debug(f"getifaddrs {d}")
 

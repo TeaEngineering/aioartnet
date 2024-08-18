@@ -659,13 +659,13 @@ class ArtNetClient:
             self.protocol.send_art_poll_reply()
 
 
-def get_iface_ip(iface: str) -> Optional[tuple[str, str, str]]:
+def get_iface_ip(iface: str) -> Optional[dict[str, Any]]:
     """
     Get network interface IP using the network interface name
     :param iface: Interface name (like eth0, enp2s0, etc.)
     :return IP address in the form XX.XX.XX.XX
     """
-    na = None
+    na = {}
     for netaddr in getifaddrs(family=socket.AF_INET, ifname=iface):
         # return first address if multiple bound to NIC
         na = dict(**netaddr)
@@ -680,7 +680,7 @@ def get_preferred_artnet_interface() -> str:
     patterns = list(map(re.compile, PREFERED_INTERFACES_ORDER))
 
     for netaddr in getifaddrs(family=socket.AF_INET):
-        name = netaddr["name"]
+        name = str(netaddr["name"])
         packet = netaddr["addr"]
         netmask = netaddr["netmask"]
         bcast = netaddr["broadaddr"]
