@@ -9,6 +9,7 @@ import time
 from collections import defaultdict
 from typing import Any, Optional, Tuple, Union, cast
 
+from .network import getifaddrs
 # Art-Net implementation for Python asyncio
 # Any page references to 'spec' refer to
 #   "Art-Net 4 Protocol Release V1.4 Document Revision 1.4di 29/7/2023"
@@ -648,37 +649,31 @@ def get_iface_ip(iface: str) -> Optional[tuple[str, str, str]]:
     :param iface: Interface name (like eth0, enp2s0, etc.)
     :return IP address in the form XX.XX.XX.XX
     """
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            iface_bin = struct.pack("256s", bytes(iface, "utf-8"))
-            packet_ip = fcntl.ioctl(s, SIOCGIFADDR, iface_bin)[20:24]
-            netmask = fcntl.ioctl(s, SIOCGIFNETMASK, iface_bin)[20:24]
-            bcast = fcntl.ioctl(s, SIOCGIFBRDADDR, iface_bin)[20:24]
-        a, b, c = map(socket.inet_ntoa, [packet_ip, netmask, bcast])
-        return a, b, c
-    except OSError:
-        return None
+    for netaddr in getifaddrs(family=socket.AF_INET, ifname=iface):
+        # return first address if multiple bound to NIC
+        return netaddr['addr'], netaddr['netmask'], netaddr['broadaddr']
 
 
 def get_preferred_artnet_interface() -> str:
     preferred = []
     patterns = list(map(re.compile, PREFERED_INTERFACES_ORDER))
-    for idx, name in socket.if_nameindex():
-        if p := get_iface_ip(name):
-            packet, netmask, bcast = p
-            logger.debug(f"interface idx={idx} name={name} {packet} {netmask} {bcast}")
-            # looks like an explicit class-A primary interface for Art-Net
-            if netmask == "255.0.0.0" and packet.startswith("2."):
-                preferred.append((-1, name))
-            else:
-                for i, pattern in enumerate(patterns):
-                    if re.match(pattern, name):
-                        preferred.append((i, name))
-                        break
-                else:
-                    preferred.append((10, name))
-        else:
-            logger.debug(f"interface idx={idx} name={name} has no IP")
+
+    for netaddr in getifaddrs(family=socket.AF_INET):
+       name = netaddr['name']
+       packet = netaddr['addr']
+       netmask = netaddr['netmask']
+       bcast = netaddr['broadaddr']
+       logger.debug(f"interface name={name} {packet} {netmask} {bcast}")
+       # looks like an explicit class-A primary interface for Art-Net
+       if netmask == "255.0.0.0" and packet.startswith("2."):
+           preferred.append((-1, name))
+       else:
+           for i, pattern in enumerate(patterns):
+               if re.match(pattern, name):
+                   preferred.append((i, name))
+                   break
+           else:
+               preferred.append((10, name))
 
     preferred = sorted(preferred)
     logger.info(f"preferred interfaces: {preferred}")
