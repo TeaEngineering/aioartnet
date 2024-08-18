@@ -1,5 +1,4 @@
 import asyncio
-import fcntl
 import ipaddress
 import logging
 import re
@@ -8,6 +7,8 @@ import struct
 import time
 from collections import defaultdict
 from typing import Any, Optional, Tuple, Union, cast
+
+from .network import AF_PACKET, getifaddrs
 
 # Art-Net implementation for Python asyncio
 # Any page references to 'spec' refer to
@@ -156,6 +157,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             0x5000: self.on_art_dmx,
         }
         client.protocol = self
+        self.node_report_counter = 0
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = cast(asyncio.DatagramTransport, transport)
@@ -343,14 +345,15 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
 
     def _send_art_poll(self) -> None:
         self._last_poll = time.time()
-        message = ARTNET_PREFIX + struct.pack("<HBBBB", 0x2000, 0, 14, 6, 16)
+        self.node_report_counter = (self.node_report_counter + 1) % 10000
+        message = ARTNET_PREFIX + struct.pack("<HBBBB", 0x2000, 0, 14, 2, 16)
         logger.debug(f"sending poll to {self.client.broadcast_ip}")
         if self.transport:
             self.transport.sendto(message, addr=(self.client.broadcast_ip, ARTNET_PORT))
 
     def _send_art_dmx(self, u: ArtNetUniverse) -> None:
         u._last_publish = time.time()
-        u._last_seq = 1 + ((u._last_seq + 1) % 255)
+        u._last_seq = (u._last_seq + 1) % 255
         logger.debug(f"send_art_dmx {u} to {u.subscribers}")
         for s in u.subscribers:
             self._send_art_dmx_subscriber(u, s, u._last_seq)
@@ -368,12 +371,12 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             socket.inet_aton(self.client.unicast_ip), byteorder="little", signed=False
         )
         bindip = ip
-        oemCode = 0
+        oemCode = 0x2CD3
         esta = 0x02AE
         status2 = 0x08  # 15-bit port-address supported
         status3 = 0
         user = 0
-        refresh = 40
+        refresh = 0
 
         # build dynamically from ports[]
         ptype = bytearray(4)
@@ -385,6 +388,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         # defaults used when we have zero ports!
         net = self.client.net
         subnet = self.client.subnet
+        mac = self.client.mac
 
         for i, p in enumerate(ports):
             ptype[i] = p.media | (1 << (6 if p.isinput else 7))
@@ -394,10 +398,10 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             else:
                 swout[i] = universe
 
-        mac = b"\01\22\33\44\55\66"
+        nodereport = f"#0001 [{self.node_report_counter:04d}] Debug OK".encode()
 
         data = ARTNET_PREFIX + struct.pack(
-            "<HIHHBBHBBH18s64s64sH4s4s4s4s4sBBB3xB6sIBB4sB6xHH11x",
+            "<HIHHBBHBBH18s64s64sBB4s4s4s4s4sBBB3xB6sIBB4sB6xHH11x",
             0x2100,
             ip,
             ARTNET_PORT,
@@ -410,7 +414,8 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             esta,
             self.client._portName.encode(),
             self.client._longName.encode(),
-            b"",
+            nodereport,
+            0,
             len(ports),
             ptype,
             ins,
@@ -441,7 +446,15 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         subuni = universe.portaddress & 0xFF
         net = universe.portaddress >> 8
         message = ARTNET_PREFIX + struct.pack(
-            "<HBBBBBBH", 0x5000, 0, 14, seq, 0, subuni, net, swap16(DMX_UNIVERSE_SIZE)
+            "<HBBBBBBH",
+            0x5000,
+            0,
+            14,
+            1 + seq,
+            0,
+            subuni,
+            net,
+            swap16(DMX_UNIVERSE_SIZE),
         )
         message = message + universe.last_data
 
@@ -484,6 +497,8 @@ class ArtNetClient:
         self.broadcast_ip: Optional[str] = None
         self.unicast_ip: Optional[str] = None
         self.listen_ip: str = "0.0.0.0"
+        self.mac: bytes = b"\01\22\33\44\55\66"
+
         self.protocol: Optional[ArtNetClientProtocol] = None
         self._publishing: list[ArtNetUniverse] = []
         self.interface: Optional[str] = interface
@@ -501,10 +516,12 @@ class ArtNetClient:
                 raise Exception(
                     f"Unable to determine IPs for interface '{self.interface}'"
                 )
-            self.unicast_ip, _, self.broadcast_ip = ips
+            self.unicast_ip = ips["addr"]
+            self.broadcast_ip = ips["broadaddr"]
+            self.mac = bytes.fromhex(ips["mac"])
 
         logger.info(
-            f"using interface {self.interface} with ip {self.unicast_ip} broadcast ip {self.broadcast_ip}, listening on {self.listen_ip}"
+            f"using interface {self.interface} with ip {self.unicast_ip} broadcast ip {self.broadcast_ip}, listening on {self.listen_ip} our mac {self.mac.hex()}"
         )
 
         # create_datagram_endpoint only allows us to listen on a single address. Ideally we would listen for packets
@@ -642,43 +659,42 @@ class ArtNetClient:
             self.protocol.send_art_poll_reply()
 
 
-def get_iface_ip(iface: str) -> Optional[tuple[str, str, str]]:
+def get_iface_ip(iface: str) -> Optional[dict[str, Any]]:
     """
     Get network interface IP using the network interface name
     :param iface: Interface name (like eth0, enp2s0, etc.)
     :return IP address in the form XX.XX.XX.XX
     """
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            iface_bin = struct.pack("256s", bytes(iface, "utf-8"))
-            packet_ip = fcntl.ioctl(s, SIOCGIFADDR, iface_bin)[20:24]
-            netmask = fcntl.ioctl(s, SIOCGIFNETMASK, iface_bin)[20:24]
-            bcast = fcntl.ioctl(s, SIOCGIFBRDADDR, iface_bin)[20:24]
-        a, b, c = map(socket.inet_ntoa, [packet_ip, netmask, bcast])
-        return a, b, c
-    except OSError:
-        return None
+    na = {}
+    for netaddr in getifaddrs(family=socket.AF_INET, ifname=iface):
+        # return first address if multiple bound to NIC
+        na = dict(**netaddr)
+    for netaddr in getifaddrs(family=AF_PACKET, ifname=iface):
+        # return first address if multiple bound to NIC
+        na["mac"] = netaddr["addr"]
+    return na
 
 
 def get_preferred_artnet_interface() -> str:
     preferred = []
     patterns = list(map(re.compile, PREFERED_INTERFACES_ORDER))
-    for idx, name in socket.if_nameindex():
-        if p := get_iface_ip(name):
-            packet, netmask, bcast = p
-            logger.debug(f"interface idx={idx} name={name} {packet} {netmask} {bcast}")
-            # looks like an explicit class-A primary interface for Art-Net
-            if netmask == "255.0.0.0" and packet.startswith("2."):
-                preferred.append((-1, name))
-            else:
-                for i, pattern in enumerate(patterns):
-                    if re.match(pattern, name):
-                        preferred.append((i, name))
-                        break
-                else:
-                    preferred.append((10, name))
+
+    for netaddr in getifaddrs(family=socket.AF_INET):
+        name = str(netaddr["name"])
+        packet = netaddr["addr"]
+        netmask = netaddr["netmask"]
+        bcast = netaddr["broadaddr"]
+        logger.debug(f"interface name={name} {packet} {netmask} {bcast}")
+        # looks like an explicit class-A primary interface for Art-Net
+        if netmask == "255.0.0.0" and packet.startswith("2."):
+            preferred.append((-1, name))
         else:
-            logger.debug(f"interface idx={idx} name={name} has no IP")
+            for i, pattern in enumerate(patterns):
+                if re.match(pattern, name):
+                    preferred.append((i, name))
+                    break
+            else:
+                preferred.append((10, name))
 
     preferred = sorted(preferred)
     logger.info(f"preferred interfaces: {preferred}")
