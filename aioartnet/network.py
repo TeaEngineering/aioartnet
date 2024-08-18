@@ -16,6 +16,12 @@ from ctypes import (
 from sys import platform
 from typing import Optional
 
+
+# return MAC addresses under our own constant, because
+# on macos socket.AF_PACKET is not defined, and the value
+# differs by platform
+AF_PACKET = 17
+
 if platform == "linux" or platform == "linux2":
 
     class Sockaddr(ctypes.Structure):
@@ -25,7 +31,7 @@ if platform == "linux" or platform == "linux2":
         ]
 
     ipv4_addr_data_offset = 2
-    AF_PACKET = socket.AF_PACKET
+
 elif platform == "darwin":
 
     class Sockaddr(Structure):
@@ -36,7 +42,6 @@ elif platform == "darwin":
         ]
 
     ipv4_addr_data_offset = 2
-    AF_PACKET = 17
 else:
     raise ValueError("Unsupported platform")
 
@@ -89,9 +94,13 @@ def getifaddrs(ifname: Optional[str] = None, family: Optional[int] = None):
         elif fam == socket.AF_INET6:
             d["addr"] = socket.inet_ntop(fam, addr[6:22])
             d["netmask"] = socket.inet_ntop(fam, netmask[6:22])
-        elif fam == AF_PACKET:
+        elif fam == 17:  # linux MAC addr
             d["addr"] = addr[10:16].hex()
             d["broadaddr"] = broadaddr[10:16].hex()
+            fam = AF_PACKET
+        elif fam == 18:  # macos MAC addr
+            d["addr"] = addr[9:15].hex()
+            fam = AF_PACKET
         logging.debug(f"getifaddrs {d}")
 
         ifaddr_p = ifaddr_p.contents.ifa_next
