@@ -371,7 +371,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             socket.inet_aton(self.client.unicast_ip), byteorder="little", signed=False
         )
         bindip = ip
-        oemCode = 0
+        oemCode = 0x2CD3
         esta = 0x02AE
         status2 = 0x08  # 15-bit port-address supported
         status3 = 0
