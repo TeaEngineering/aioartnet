@@ -353,7 +353,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
 
     def _send_art_dmx(self, u: ArtNetUniverse) -> None:
         u._last_publish = time.time()
-        u._last_seq = 1 + ((u._last_seq + 1) % 255)
+        u._last_seq = ((u._last_seq + 1) % 255)
         logger.debug(f"send_art_dmx {u} to {u.subscribers}")
         for s in u.subscribers:
             self._send_art_dmx_subscriber(u, s, u._last_seq)
@@ -446,7 +446,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         subuni = universe.portaddress & 0xFF
         net = universe.portaddress >> 8
         message = ARTNET_PREFIX + struct.pack(
-            "<HBBBBBBH", 0x5000, 0, 14, seq, 0, subuni, net, swap16(DMX_UNIVERSE_SIZE)
+            "<HBBBBBBH", 0x5000, 0, 14, 1+seq, 0, subuni, net, swap16(DMX_UNIVERSE_SIZE)
         )
         message = message + universe.last_data
 

@@ -7,7 +7,7 @@ from . import ArtNetClient
 
 async def main(client: ArtNetClient) -> None:
     await client.connect()
-    u5 = client.set_port_config("0:0:5", isoutput=True)
+    #u5 = client.set_port_config("0:0:5", isoutput=True)
 
     while True:
         await asyncio.sleep(5)
@@ -18,7 +18,7 @@ async def main(client: ArtNetClient) -> None:
         for univ in client.universes.values():
             print(f" {univ} pubs:{univ.publishers} subs:{univ.subscribers}")
 
-        print(u5.last_data[0:20].hex())
+        # print(u5.last_data[0:20].hex())
 
 
 if __name__ == "__main__":
