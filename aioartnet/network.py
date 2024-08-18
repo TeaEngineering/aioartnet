@@ -16,7 +16,6 @@ from ctypes import (
 from sys import platform
 from typing import Optional
 
-
 # return MAC addresses under our own constant, because
 # on macos socket.AF_PACKET is not defined, and the value
 # differs by platform

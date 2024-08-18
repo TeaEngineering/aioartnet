@@ -7,7 +7,7 @@ from . import ArtNetClient
 
 async def main(client: ArtNetClient) -> None:
     await client.connect()
-    #u5 = client.set_port_config("0:0:5", isoutput=True)
+    # u5 = client.set_port_config("0:0:5", isoutput=True)
 
     while True:
         await asyncio.sleep(5)

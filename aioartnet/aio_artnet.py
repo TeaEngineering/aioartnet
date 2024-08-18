@@ -346,14 +346,14 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
     def _send_art_poll(self) -> None:
         self._last_poll = time.time()
         self.node_report_counter = (self.node_report_counter + 1) % 10000
-        message = ARTNET_PREFIX + struct.pack("<HBBBB", 0x2000, 0, 14, 6, 16)
+        message = ARTNET_PREFIX + struct.pack("<HBBBB", 0x2000, 0, 14, 2, 16)
         logger.debug(f"sending poll to {self.client.broadcast_ip}")
         if self.transport:
             self.transport.sendto(message, addr=(self.client.broadcast_ip, ARTNET_PORT))
 
     def _send_art_dmx(self, u: ArtNetUniverse) -> None:
         u._last_publish = time.time()
-        u._last_seq = ((u._last_seq + 1) % 255)
+        u._last_seq = (u._last_seq + 1) % 255
         logger.debug(f"send_art_dmx {u} to {u.subscribers}")
         for s in u.subscribers:
             self._send_art_dmx_subscriber(u, s, u._last_seq)
@@ -376,7 +376,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         status2 = 0x08  # 15-bit port-address supported
         status3 = 0
         user = 0
-        refresh = 40
+        refresh = 0
 
         # build dynamically from ports[]
         ptype = bytearray(4)
@@ -446,7 +446,15 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         subuni = universe.portaddress & 0xFF
         net = universe.portaddress >> 8
         message = ARTNET_PREFIX + struct.pack(
-            "<HBBBBBBH", 0x5000, 0, 14, 1+seq, 0, subuni, net, swap16(DMX_UNIVERSE_SIZE)
+            "<HBBBBBBH",
+            0x5000,
+            0,
+            14,
+            1 + seq,
+            0,
+            subuni,
+            net,
+            swap16(DMX_UNIVERSE_SIZE),
         )
         message = message + universe.last_data
 
