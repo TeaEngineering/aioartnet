@@ -1,6 +1,5 @@
 
-![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/TeaEngineering/aioartnet/check.yml) ![PyPI version](https://badge.fury.io/py/aioartnet.svg)
-
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/TeaEngineering/aioartnet/check.yml) [![PyPI version](https://badge.fury.io/py/aioartnet.svg)](https://badge.fury.io/py/aioartnet)
 
 **aioartnet** is a pure python [asyncio connector](https://docs.python.org/3/library/asyncio.html) for the [royalty-free Art-Net protocol](https://art-net.org.uk/background/), which is a transport to transmit and recieve the [DMX-512 lighting control protocol](https://en.wikipedia.org/wiki/DMX512) over Ethernet (UDP). The protocol is the modern standard for interconnecting complex lighting fixtures directly, and for branching out individual universes for a specific local area to control classic DMX-512 XLR-cable interlinked fixtures. Both open and propriety lighting control systems can emit Art-Net directly.
 
