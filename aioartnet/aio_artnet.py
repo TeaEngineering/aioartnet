@@ -458,7 +458,9 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         )
         message = message + universe.last_data
 
-        logger.debug(f"sending dmx for {universe} to {node} at {node.ip}:{node.udpport}")
+        logger.debug(
+            f"sending dmx for {universe} to {node} at {node.ip}:{node.udpport}"
+        )
         if self.transport:
             self.transport.sendto(message, addr=(node.ip, node.udpport))
 
