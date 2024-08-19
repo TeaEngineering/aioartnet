@@ -81,21 +81,21 @@ class ArtNetNode:
         self,
         longName: str,
         portName: str,
-        address: str,
         style: int,
-        addr: tuple[str, int],
+        ip: str,
+        udpport: int,
     ) -> None:
         self.portName = portName
         self.longName = longName
-        self.address = address
         self._portBinds: defaultdict[int, list[ArtNetPort]] = defaultdict(list)
-        self._addr = addr
         self.ports: list[ArtNetPort] = []
         self.style: int = style
+        self.udpport = udpport
+        self.ip = ip
         self.last_reply: float = 0.0
 
     def __repr__(self) -> str:
-        return f"ArtNetNode<{self.portName},{self.address}>"
+        return f"ArtNetNode<{self.portName},{self.ip}:{self.udpport}>"
 
 
 class ArtNetUniverse:
@@ -237,11 +237,11 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
 
         if nn is None or changed:
             newnode = ArtNetNode(
-                address=f"{ipa}:{port}",
+                ip=f"{ipa}",
+                udpport=port,
                 longName=longName,
                 portName=portName,
                 style=style,
-                addr=addr,
             )
             if changed:
                 logger.debug(f"change detected: from {nn} to {newnode}")
@@ -458,9 +458,9 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         )
         message = message + universe.last_data
 
-        logger.debug(f"sending dmx for {universe} to {node} at {node._addr}")
+        logger.debug(f"sending dmx for {universe} to {node} at {node.ip}:{node.udpport}")
         if self.transport:
-            self.transport.sendto(message, addr=node._addr)
+            self.transport.sendto(message, addr=(node.ip, node.udpport))
 
     def error_received(self, exc: Exception) -> None:
         logger.warn("Error received:", exc)
