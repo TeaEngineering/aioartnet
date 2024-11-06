@@ -16,8 +16,12 @@ description = "Pure Python asyncio connector to Art-Net DMX Universes"
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = [
-    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
+    "Framework :: AsyncIO",
     "Operating System :: OS Independent",
 ]
 dynamic = ["version"]
