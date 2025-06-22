@@ -210,7 +210,7 @@ async def test_ports() -> None:
     clA = ArtNetClient(interface="dummy", portName="alpha")
     clA.broadcast_ip = "10.10.10.255"
     clA.unicast_ip = "10.10.10.10"
-    clA.set_port_config("1:0:7", isinput=True)
+    clA.set_port_config("1:0:7", is_input=True)
 
     protoA = ArtNetClientProtocol(clA)
     transport = BroadcastTransport([protoA])
@@ -231,7 +231,7 @@ async def test_ports() -> None:
 
     # disable existing, add an output port
     clA.set_port_config("1:0:7")
-    clA.set_port_config("0:1:8", isoutput=True)
+    clA.set_port_config("0:1:8", is_output=True)
 
     transport.drain()
     assert str(clA._portBinds) == "{1: [Port<Output,DMX,0:1:8>]}"
@@ -244,7 +244,7 @@ async def test_ports() -> None:
     assert str(clA.universes[24].subscribers) == "[ArtNetNode<alpha,10.10.10.10:6454>]"
 
     # two ports active at once
-    clA.set_port_config("0:1:9", isinput=True)
+    clA.set_port_config("0:1:9", is_input=True)
     transport.drain()
     assert clA.universes[24].publishers == []
     assert str(clA.universes[24].subscribers) == "[ArtNetNode<alpha,10.10.10.10:6454>]"
@@ -269,18 +269,18 @@ async def test_dmx_tx_rx() -> None:
     protoB = ArtNetClientProtocol(clB)
     transport = BroadcastTransport([protoA, protoB])
 
-    utx = clA.set_port_config("1:0:7", isinput=True)
-    urx = clB.set_port_config("1:0:7", isoutput=True)
+    utx = clA.set_port_config("1:0:7", is_input=True)
+    urx = clB.set_port_config("1:0:7", is_output=True)
 
-    assert urx.last_data == bytes(DMX_UNIVERSE_SIZE)
+    assert urx.get_dmx() == bytes(DMX_UNIVERSE_SIZE)
 
     # send, then flush the poll/reply packets
     protoA._send_art_poll()
     transport.drain()
 
     test_pattern = bytes(list(range(128)) * 4)
-    await clA.set_dmx(utx, test_pattern)
+    clA.set_dmx(utx, test_pattern)
     assert len(transport.pending) == 1
     transport.drain()
 
-    assert urx.last_data == test_pattern
+    assert urx.get_dmx() == test_pattern

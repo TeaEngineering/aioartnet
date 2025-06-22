@@ -5,7 +5,7 @@
 
 This library aims to be simple and robust, and can both input data into Art-Net, as well as output it from "artnet" to your user code. It builds a dynamic model of the network's Art-Net nodes, their ports and the universe(s) of DMX-512 that are being controlled. Fully type hinted to comply with `PEP-561`. No non-core dependancies, with a test suite that runs on Python 3.9 to 3.12.
 
-It can also be used __passively__ to build the network model without joining as an Art-Net Node.
+It can also be used __passively__ to build the network model without joining as an Art-Net Node, by listening to the broadcasts from other Art-Net devices. However it is not usually possible to monitor the DMX values passively.
 
 We also have a propriety iOS/Xcode component available for commercial licensing that uses the same event driven API as this code, built on top of Apple's Networking framework `NWProtocolUDP`. This will be a significantly better starting point for new designs than [libartnet](https://github.com/OpenLightingProject/libartnet) for most projects.
 
@@ -39,18 +39,18 @@ Getting Started
 ```
 2) Configure the desired input/output ports on the client using `set_port_config()`, each call returns `ArtNetUniverse` objects. Use these to optionally set the initial published value of universes set as ArtNet inputs:
 ```python
-    u1 = client.set_port_config("0:0:1", isinput=True)
-    u5 = client.set_port_config("0:0:5", isoutput=True)
-    u1.last_data[:] = list(range(128))*4
+    u1 = client.set_port_config("0:0:1", is_input=True)
+    u5 = client.set_port_config("0:0:5", is_output=True)
+    u1.set_dmx(bytes(list(range(128))*4))
 ```
 
 3) Await the co-routine `client.connect()` from an asyncio asynchronous context, e.g:
 ```python
     async def main() -> None:
         client = ArtNetClient()
-        u1 = client.set_port_config("0:0:1", isinput=True)
-        u5 = client.set_port_config("0:0:5", isoutput=True)
-        u1.last_data[:] = list(range(128))*4
+        u1 = client.set_port_config("0:0:1", is_input=True)
+        u5 = client.set_port_config("0:0:5", is_output=True)
+        u1.set_dmx(bytes(list(range(128))*4))
         await client.connect()
 
     if __name__ == "__main__":
@@ -59,7 +59,7 @@ Getting Started
         asyncio.get_event_loop().run_forever()
 ```
 
-4) Once the client is connected, you can add/configure further ports, read the universes of DMX data and change published values.
+4) Once the client is connected, you can add/configure further ports, read the universes of DMX data with `universe.get_dmx()` and for input ports, change the published values with `universe.set_dmx(bytes)`.
 
 5) The return value from `client.connect()` is an `ayncio.DatagramTransport`. If you call `close()` on this transport, the periodic task is also cancelled.
 

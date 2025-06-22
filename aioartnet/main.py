@@ -42,8 +42,7 @@ if __name__ == "__main__":
         kwargs["portName"] = args.portName
     client = ArtNetClient(**kwargs)
     if args.publish:
-        u1 = client.set_port_config("0:0:1", isinput=True)
-        u1.last_data[:] = list(range(128)) * 4
-
+        u1 = client.set_port_config("0:0:0", is_input=True)
+        u1.set_dmx(bytes(list(range(128)) * 4))
     asyncio.run(main(client))
     asyncio.get_event_loop().run_forever()
