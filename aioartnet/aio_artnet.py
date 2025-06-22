@@ -108,7 +108,9 @@ class ArtNetUniverse:
         self.last_data = bytearray(DMX_UNIVERSE_SIZE)
         self._last_seq = 1
         self._last_publish: float = 0.0
+        self._last_tod_request: float = 0.0
         self.publisherseq: dict[Tuple[DGAddr, int], int] = {}
+        self.tod_uuids: set[bytes] = set()
 
     def split(self) -> Tuple[int, int, int]:
         # name  net:sub_net:universe
@@ -162,6 +164,8 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             0x2000: self.on_art_poll,
             0x2100: self.on_art_poll_reply,
             0x5000: self.on_art_dmx,
+            0x8000: self.on_art_tod_request,
+            0x8100: self.on_art_tod_data,
         }
         client.protocol = self
         self.node_report_counter = 0
@@ -179,7 +183,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             if h:
                 h(addr, data[10:])
             else:
-                logger.debug(
+                logger.info(
                     f"Received unsupported Art-Net: op {hex(opcode)} from {addr}: {data[10:]!r}"
                 )
         else:
@@ -338,6 +342,44 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         # Only two sources are allowed to contribute to the values in the universe
         u.last_data[0:chlen] = data[8 : 8 + chlen]
 
+    def on_art_tod_request(self, addr: DGAddr, data: bytes) -> None:
+        (ver,) = struct.unpack("<H", data[0:2])
+        net = data[11]
+        cmd = data[12]
+        address_count = data[13]
+        # net+address => universe address
+        for universe in [int(x) + net << 8 for x in data[14 : 14 + address_count]]:
+            logger.debug(
+                f"Received Art-Net TOD request: ver {ver} cmd {cmd} universe {universe} from {addr}"
+            )
+            # TODO: if we are an output, answer this with our cached tod table by sending
+            # art_tod_data packets
+
+    def on_art_tod_data(self, addr: DGAddr, data: bytes) -> None:
+        ver, rdm_ver, port = struct.unpack("<HBB", data[0:4])
+        # 6 bytes spare
+        bind_index, net, response, address, tot_uid, block_count, uid_count = (
+            struct.unpack("<BBBBHBB", data[10:18])
+        )
+        portaddress = net << 8 + address
+        TOD_FULL = 0
+
+        if response != TOD_FULL:
+            logger.info(
+                "Got unexpected art_tod_data with response {response} from {addr}"
+            )
+            return
+
+        u = self.client._get_create_universe(portaddress)
+
+        # I think tot_uid and block_count are *paging* related if more tod UIDs than can fit in a packet
+        for i in range(uid_count):
+            uid = data[18 + i * 6 : 18 + (i + 1) * 6]
+            u.tod_uuids.add(uid)
+            logger.info(
+                f"Received Art-Net TOD entry: universe {portaddress} uid={uid.hex()} from {addr}"
+            )
+
     async def art_poll_task(self) -> None:
         while True:
             await asyncio.sleep(0.1)
@@ -346,6 +388,8 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             for u in self.client._publishing:
                 if t > u._last_publish + 1.0:
                     self._send_art_dmx(u)
+                if t > u._last_tod_request + 5.0:
+                    self._send_art_tod_request(u)
 
             if t > self._last_poll + 2.0:
                 self._send_art_poll()
@@ -471,6 +515,37 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         if self.transport:
             self.transport.sendto(message, addr=(node.ip, node.udpport))
 
+    def _send_art_tod_request(self, universe: ArtNetUniverse):
+        logger.debug(f"sending art tod request for {universe}")
+        universe._last_tod_request = time.time()
+
+        subuni = universe.portaddress & 0xFF
+        net = universe.portaddress >> 8
+        message = ARTNET_PREFIX + struct.pack(
+            "<HBBBBBBBBBBBBBBB",
+            0x8000,
+            0,
+            14,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            net,
+            0,  # command TodFull
+            1,
+            subuni,
+        )
+
+        if self.transport:
+            # send direct to node?
+            #    self.transport.sendto(message, addr=(node.ip, node.udpport))
+            self.transport.sendto(message, addr=(self.client.broadcast_ip, ARTNET_PORT))
+
     def error_received(self, exc: Exception) -> None:
         logger.warn("Error received:", exc)
 
@@ -589,6 +664,7 @@ class ArtNetClient:
         universe: UniverseKey,
         is_input: bool = False,
         is_output: bool = False,
+        rdm: bool = False,
     ) -> ArtNetUniverse:
         port_addr = self._parse_universe(universe)
 

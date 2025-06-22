@@ -134,5 +134,12 @@ This application aims to be fully compatible with Art-Net devices. We have teste
 * iOS [DMX Monitor app](https://apps.apple.com/us/app/dmx-monitor/id1544911427)
 * Many other iOS apps
 
-
 ![Art-Net logo](./docs/art-net-master-logo.svg) Art-Net™ Designed by and Copyright Artistic Licence Engineering Ltd.
+
+RDM
+---
+
+See https://www.rdmprotocol.org/rdm/
+
+RDM specs are https://tsp.esta.org/tsp/documents/published_docs.php
+
