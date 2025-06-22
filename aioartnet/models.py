@@ -1,6 +1,8 @@
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol, Tuple, Union
+from typing import Any, Optional, Protocol, Sequence, Tuple, Union
+
+from .rdm import RDMDevice
 
 DMX_UNIVERSE_SIZE = 512
 
@@ -43,8 +45,10 @@ class ArtNetUniverse:
         self.last_data = bytearray(DMX_UNIVERSE_SIZE)
         self._last_seq = 1
         self._last_publish: float = 0.0
+        self._last_tod_request: float = 0.0
         self.publisherseq: dict[Tuple[DatagramAddr, int], int] = {}
         self._client = client
+        self._tod: dict[bytes, RDMDevice] = {}
 
     def split(self) -> Tuple[int, int, int]:
         # name  net:sub_net:universe
@@ -66,6 +70,9 @@ class ArtNetUniverse:
     def get_dmx(self) -> bytes:
         return self.last_data
 
+    def get_rdm_uuids(self) -> Sequence[bytes]:
+        return list(self._tod.keys())
+
     # eq/hash based on portaddress only
     def __hash__(self) -> int:
         return hash(self.portaddress)
@@ -84,6 +91,7 @@ class ArtNetPort:
     media: int
     portaddr: int
     universe: ArtNetUniverse
+    flags: int
 
     def __repr__(self) -> str:
         inout = {True: "Input", False: "Output"}[self.is_input]
