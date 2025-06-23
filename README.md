@@ -98,7 +98,7 @@ Features
 | 15-bit port addresses                  | :heavy_check_mark:  | :heavy_check_mark: |
 | >4 ports (bindIndex) on same IP        | :heavy_check_mark:  | :heavy_check_mark: |
 | merge-mode (LTP/HTP) in reciever       | -                   | -                  |
-| RDM commands to enumerate fixtures     | -                   | -                  |
+| RDM commands to enumerate fixtures     | :heavy_check_mark:  | :heavy_check_mark: |
 | Timecode                               | -                   | -                  |
 | Multi-universe sync message            | -                   | -                  |
 | local node reconfigure by API          | :heavy_check_mark:  | :heavy_check_mark: |
@@ -119,9 +119,11 @@ Implemented Messages
 | ArtDiagData                        | -                   | -                  |
 | ArtTimeCode                        | -                   | -                  |
 | ArtCommand                         | -                   | -                  |
+| ArtNzs                             | -                   | -                  |
 | ArtTrigger                         | -                   | -                  |
 | ArtSync                            | -                   | -                  |
-| RDM ArtTodRequest / ArtTodData / ArtTodControl / ArtRdm / ArtRdmSub | - | - |
+| RDM ArtTodRequest / ArtTodData / ArtTodControl | :heavy_check_mark: | :heavy_check_mark: |
+| RDM ArtRdm / ArtRdmSub             | -                   | -                  |
 
 
 Art-Net
@@ -136,8 +138,12 @@ This application aims to be fully compatible with Art-Net devices. We have teste
 
 ![Art-Net logo](./docs/art-net-master-logo.svg) Art-Net™ Designed by and Copyright Artistic Licence Engineering Ltd.
 
-RDM
+DMX Remote Device Management (RDM) Support
 ---
+
+The Art-Net protocol can carry RDM messages to allow for table-of-device enumeration, and then inspection of the devices by uid.
+
+https://www.rdmprotocol.org/rdm/wp-content/uploads/2011/09/logo2.jpg
 
 See https://www.rdmprotocol.org/rdm/
 
