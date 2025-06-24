@@ -122,6 +122,7 @@ class Engine:
         else:
             next_cue = self.active_cue + (1 if change == 1 else -1)
         # if current queue is held, nudge it to fade-out
+        next_cue = next_cue % len(self.cues)
         self.activate(self.cues[next_cue])
         self.active_cue = next_cue
 
@@ -157,6 +158,7 @@ class Engine:
         while True:
             await asyncio.sleep(0.05)
             await self.poll(time.time())
+
 
 def parse_intensity(level: str) -> int:
     if level.upper() in ("F", "FL", "FULL"):
