@@ -43,3 +43,14 @@ async def test_console() -> None:
 
     # await interpreter.on_cmd("STATE")
     # await interpreter.on_cmd("LIST")
+
+
+@pytest.mark.asyncio
+async def test_console_loop() -> None:
+    set_dmx = Mock()
+    engine = Engine(set_dmx, universe_size=20)
+    interpreter = Interpreter(engine)
+    cmds = "ch 1 at f,record cue 1,ch 2 at f,record cue 2,ch 3 at f,record cue 3,go,go,go,go"
+    for cmd in cmds.split(","):
+        await interpreter.on_cmd(cmd)
+    assert engine.active_cue == 0
