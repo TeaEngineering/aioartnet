@@ -122,24 +122,31 @@ class ArtNetUniverse:
         net, sub_net, universe = self.split()
         return f"{net}:{sub_net}:{universe}"
 
+    def set_dmx(self, data: bytes) -> None:
+        assert len(data) == DMX_UNIVERSE_SIZE
+        self.last_data[:] = data[:]
+
+    def get_dmx(self) -> bytes:
+        return self.last_data
+
 
 class ArtNetPort:
     def __init__(
         self,
         node: Union[ArtNetNode, "ArtNetClient"],
-        isinput: bool,
+        is_input: bool,
         media: int,
         portaddr: int,
         universe: ArtNetUniverse,
     ):
         self.node = node
-        self.isinput = isinput
+        self.is_input = is_input
         self.media = 0
         self.portaddr = portaddr
         self.universe = universe
 
     def __repr__(self) -> str:
-        inout = {True: "Input", False: "Output"}[self.isinput]
+        inout = {True: "Input", False: "Output"}[self.is_input]
         media = ["DMX", "MIDI", "Avab", "Colortran CMX", "ADB 62.5", "Art-Net", "DALI"][
             self.media
         ]
@@ -277,7 +284,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
                 nn.ports.append(p)
                 nn._portBinds[bindindex].append(p)
                 {True: p.universe.publishers, False: p.universe.subscribers}[
-                    p.isinput
+                    p.is_input
                 ].append(nn)
 
         for p in list(old_ports):
@@ -285,7 +292,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
                 nn.ports.remove(p)
                 nn._portBinds[bindindex].remove(p)
                 {True: p.universe.publishers, False: p.universe.subscribers}[
-                    p.isinput
+                    p.is_input
                 ].remove(nn)
         logger.debug(
             f"Received Art-Net PollReply from {ip} fw {fw} portName {portName} longName: {longName} bindindex {bindindex} ports:{portList}"
@@ -391,9 +398,9 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         mac = self.client.mac
 
         for i, p in enumerate(ports):
-            ptype[i] = p.media | (1 << (6 if p.isinput else 7))
+            ptype[i] = p.media | (1 << (6 if p.is_input else 7))
             net, subnet, universe = p.universe.split()
-            if p.isinput:
+            if p.is_input:
                 swin[i] = universe
             else:
                 swout[i] = universe
@@ -542,7 +549,8 @@ class ArtNetClient:
 
         return transport
 
-    async def set_dmx(self, universe: UniverseKey, data: bytes) -> None:
+    def set_dmx(self, universe: UniverseKey, data: bytes) -> None:
+        assert len(data) == DMX_UNIVERSE_SIZE
         port_addr = self._parse_universe(universe)
 
         # where to keep our write buffer?
@@ -551,7 +559,8 @@ class ArtNetClient:
         if u not in self._publishing:
             raise ValueError(f"No input port configured for {u}")
 
-        u.last_data[:] = data[:]
+        u.set_dmx(data)
+
         if self.protocol:
             self.protocol._send_art_dmx(u)
 
@@ -576,7 +585,10 @@ class ArtNetClient:
             raise ValueError(f"invalid universe: {universe}")
 
     def set_port_config(
-        self, universe: UniverseKey, isinput: bool = False, isoutput: bool = False
+        self,
+        universe: UniverseKey,
+        is_input: bool = False,
+        is_output: bool = False,
     ) -> ArtNetUniverse:
         port_addr = self._parse_universe(universe)
 
@@ -595,9 +607,9 @@ class ArtNetClient:
             self.ports.remove(port)
             logger.info(f"removed own port {port}")
 
-        if isinput or isoutput:
+        if is_input or is_output:
             port = ArtNetPort(
-                node=self, isinput=isinput, media=0, portaddr=port_addr, universe=u
+                node=self, is_input=is_input, media=0, portaddr=port_addr, universe=u
             )
             self.ports.append(port)
             logger.info(f"configured own port {port}")
@@ -613,7 +625,7 @@ class ArtNetClient:
         # used for the timer-based DMX repeating
         if u in self._publishing:
             self._publishing.remove(u)
-        if isinput:
+        if is_input:
             self._publishing.append(u)
 
         if not self.passive and self.protocol:
