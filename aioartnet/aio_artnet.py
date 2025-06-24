@@ -99,7 +99,7 @@ class ArtNetNode:
 
 
 class ArtNetUniverse:
-    def __init__(self, portaddress: int):
+    def __init__(self, portaddress: int, client: "ArtNetClient"):
         if portaddress > 0x7FFF:
             raise ValueError("Invalid net:subnet:universe, as net>128")
         self.portaddress = portaddress
@@ -109,6 +109,7 @@ class ArtNetUniverse:
         self._last_seq = 1
         self._last_publish: float = 0.0
         self.publisherseq: dict[Tuple[DGAddr, int], int] = {}
+        self._client = client
 
     def split(self) -> Tuple[int, int, int]:
         # name  net:sub_net:universe
@@ -125,6 +126,7 @@ class ArtNetUniverse:
     def set_dmx(self, data: bytes) -> None:
         assert len(data) == DMX_UNIVERSE_SIZE
         self.last_data[:] = data[:]
+        self._client._send_dmx(self)
 
     def get_dmx(self) -> bytes:
         return self.last_data
@@ -555,14 +557,14 @@ class ArtNetClient:
 
         # where to keep our write buffer?
         u = self._get_create_universe(port_addr)
-
-        if u not in self._publishing:
-            raise ValueError(f"No input port configured for {u}")
-
         u.set_dmx(data)
 
+    def _send_dmx(self, universe: ArtNetUniverse) -> None:
+        if universe not in self._publishing:
+            raise ValueError(f"No input port configured for {universe}")
+
         if self.protocol:
-            self.protocol._send_art_dmx(u)
+            self.protocol._send_art_dmx(universe)
 
     def get_nodes(self) -> list[ArtNetNode]:
         return list(self.nodes.values())
@@ -635,7 +637,7 @@ class ArtNetClient:
 
     def _get_create_universe(self, port_addr: int) -> ArtNetUniverse:
         if (u := self.universes.get(port_addr, None)) is None:
-            u = ArtNetUniverse(port_addr)
+            u = ArtNetUniverse(port_addr, self)
             self.universes[port_addr] = u
         return u
 

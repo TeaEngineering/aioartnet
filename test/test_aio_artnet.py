@@ -15,14 +15,15 @@ from aioartnet.aio_artnet import ArtNetClientProtocol, DGAddr
 
 
 def test_universe() -> None:
-    assert str(ArtNetUniverse(4)) == "0:0:4"
-    assert str(ArtNetUniverse(0x15)) == "0:1:5"
-    assert str(ArtNetUniverse(0x315)) == "3:1:5"
-    assert str(ArtNetUniverse(0x7FF)) == "7:15:15"
-    assert str(ArtNetUniverse(0xFFF)) == "15:15:15"
-    assert str(ArtNetUniverse(0x7FFF)) == "127:15:15"
+    ac = ArtNetClient()
+    assert str(ArtNetUniverse(4, ac)) == "0:0:4"
+    assert str(ArtNetUniverse(0x15, ac)) == "0:1:5"
+    assert str(ArtNetUniverse(0x315, ac)) == "3:1:5"
+    assert str(ArtNetUniverse(0x7FF, ac)) == "7:15:15"
+    assert str(ArtNetUniverse(0xFFF, ac)) == "15:15:15"
+    assert str(ArtNetUniverse(0x7FFF, ac)) == "127:15:15"
     with pytest.raises(ValueError):
-        ArtNetUniverse(0x8FFF)  # only 128 'nets'
+        ArtNetUniverse(0x8FFF, ac)  # only 128 'nets'
 
 
 def packet_reader(file: str) -> Iterator[Tuple[float, bytes]]:

@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 import traceback
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -66,12 +67,9 @@ class ActiveCue:
             return 0.0
 
 
-def apply_ci(
-    universe: bytearray, edits: Sequence[ChannelIntensity], scale: float = 1.0
-) -> bytearray:
+def apply_ci(data: bytearray, edits: Sequence[ChannelIntensity], scale: float) -> None:
     for e in edits:
-        universe[e.channel] = e.intensity
-    return universe
+        data[e.channel] = max(0, min(255, int(e.intensity * scale)))
 
 
 class Engine:
@@ -109,7 +107,7 @@ class Engine:
 
         # add live edits
         if self.live_edit:
-            apply_ci(live, self.edits)
+            apply_ci(live, self.edits, 1.0)
 
         # print(f'calling handler {self.handler} with {self.live}')
         self.handler(live)
@@ -151,6 +149,14 @@ class Engine:
         else:
             ci.append(edit)
 
+    async def start_tick(self) -> asyncio.Task[None]:
+        self._tick_task = asyncio.create_task(self._tick())
+        return self._tick_task
+
+    async def _tick(self) -> None:
+        while True:
+            await asyncio.sleep(0.05)
+            await self.poll(time.time())
 
 def parse_intensity(level: str) -> int:
     if level.upper() in ("F", "FL", "FULL"):
@@ -210,9 +216,9 @@ class Interpreter:
                     cn = parse_user_index(cue_num, self.engine.cues, extend=True)
                     cue = Cue(
                         name="",
-                        fade_in=0,
-                        hold=0,
-                        fade_out=0,
+                        fade_in=1,
+                        hold=3,
+                        fade_out=1,
                         channels=list(self.engine.edits),
                     )
                     print(f"inserting {cue} as cue {cn}")
@@ -269,6 +275,7 @@ async def main(client: ArtNetClient, engine: Engine, interpreter: Interpreter) -
     session: PromptSession[str] = PromptSession("> ", history=history)
 
     await client.connect()
+    await engine.start_tick()
 
     # Run echo loop. Read text from stdin, and reply it back.
     while True:
