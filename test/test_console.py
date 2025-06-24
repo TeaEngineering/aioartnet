@@ -2,16 +2,16 @@ from unittest.mock import Mock
 
 import pytest
 
-from aioartnet.console import Engine, Intepreter
+from aioartnet.console import Engine, Interpreter
 
 
 @pytest.mark.asyncio
 async def test_console() -> None:
     set_dmx = Mock()
-    engine = Engine(set_dmx)
-    interpreter = Intepreter(engine)
+    engine = Engine(set_dmx, universe_size=20)
+    interpreter = Interpreter(engine)
 
-    exp = bytearray(512)
+    exp = bytearray(20)
     await interpreter.on_cmd("live on")
     set_dmx.assert_called_with(exp)
     assert engine.cues == []
@@ -24,13 +24,22 @@ async def test_console() -> None:
     exp[9:19] = bytes([51] * 10)
     set_dmx.assert_called_with(exp)
 
+    # saving clears the live edits
     await interpreter.on_cmd("RECORD CUE 1")
     assert len(engine.cues) == 1
-    set_dmx.assert_called_with(exp)
+    zeros = bytearray(20)
+    set_dmx.assert_called_with(zeros)
 
     # await interpreter.on_cmd("RECORD CUE 2 TIME 4")
     # await interpreter.on_cmd("RECORD CUE 3 TIME 2 DELAY 1")
+    # assert len(engine.cues) == 3
+
     # await interpreter.on_cmd("CUE 3 LABEL \"Scene 1 blackout\"")
-    # await interpreter.on_cmd("GO")
+    assert engine.active_cue is None
+    await interpreter.on_cmd("GO")
+    assert engine.active_cue == 0
+
+    set_dmx.assert_called_with(exp)
+
     # await interpreter.on_cmd("STATE")
     # await interpreter.on_cmd("LIST")
