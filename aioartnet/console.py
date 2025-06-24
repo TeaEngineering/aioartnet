@@ -150,7 +150,7 @@ class Engine:
         else:
             ci.append(edit)
 
-    async def start_tick(self) -> asyncio.Task[None]:
+    async def start_ticking(self) -> asyncio.Task[None]:
         self._tick_task = asyncio.create_task(self._tick())
         return self._tick_task
 
@@ -186,6 +186,10 @@ def parse_user_index(value: str, items: Sequence[Any], extend: bool = False) -> 
     return cn
 
 
+def parse_duration(value: str) -> int:
+    return int(value)
+
+
 # interprets simple commands and formats the responses
 class Interpreter:
     def __init__(self, engine: Engine):
@@ -212,15 +216,33 @@ class Interpreter:
                 intensity = parse_intensity(level)
                 parse_user_index(chan, self.engine.subs, extend=False)
                 # self.engine.subs[]
-            case ["record", ("cue" | "sub") as target, cue_num]:
+            case ["record", ("cue" | "sub") as target, cue_num, *args]:
                 # record cue 1 time 3
+                fade_in = 0
+                fade_out = 0
+                hold = 1
+                while args:
+                    match args:
+                        case ["fade", duration, *more]:
+                            fade_in = parse_duration(duration)
+                            fade_out = fade_in
+                        case ["fade_in", duration, *more]:
+                            fade_in = parse_duration(duration)
+                        case ["fade_out", duration, *more]:
+                            fade_out = parse_duration(duration)
+                        case ["hold", duration, *more]:
+                            hold = parse_duration(duration)
+                        case _:
+                            raise ValueError(f"unknown record args {args}")
+                    args = more
+
                 if target == "cue":
                     cn = parse_user_index(cue_num, self.engine.cues, extend=True)
                     cue = Cue(
                         name="",
-                        fade_in=1,
-                        hold=3,
-                        fade_out=1,
+                        fade_in=fade_in,
+                        hold=hold,
+                        fade_out=fade_out,
                         channels=list(self.engine.edits),
                     )
                     print(f"inserting {cue} as cue {cn}")
@@ -277,7 +299,7 @@ async def main(client: ArtNetClient, engine: Engine, interpreter: Interpreter) -
     session: PromptSession[str] = PromptSession("> ", history=history)
 
     await client.connect()
-    await engine.start_tick()
+    await engine.start_ticking()
 
     # Run echo loop. Read text from stdin, and reply it back.
     while True:

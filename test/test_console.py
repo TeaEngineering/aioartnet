@@ -30,9 +30,9 @@ async def test_console() -> None:
     zeros = bytearray(20)
     set_dmx.assert_called_with(zeros)
 
-    # await interpreter.on_cmd("RECORD CUE 2 TIME 4")
-    # await interpreter.on_cmd("RECORD CUE 3 TIME 2 DELAY 1")
-    # assert len(engine.cues) == 3
+    await interpreter.on_cmd("RECORD CUE 2 HOLD 4")
+    await interpreter.on_cmd("RECORD CUE 3 HOLD 2 FADE 1")
+    assert len(engine.cues) == 3
 
     # await interpreter.on_cmd("CUE 3 LABEL \"Scene 1 blackout\"")
     assert engine.active_cue is None
