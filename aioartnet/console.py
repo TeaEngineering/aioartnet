@@ -241,12 +241,12 @@ class Interpreter:
             case ["list"]:
                 if self.engine.cues:
                     for idx, cue in enumerate(self.engine.cues):
-                        print(f"cue {idx+1:03} {cue}")
+                        print(f"cue {idx + 1:03} {cue}")
                 else:
                     print("No cues")
                 if self.engine.subs:
                     for idx, sub in enumerate(self.engine.subs):
-                        print(f"sub {idx+1:03} {sub}")
+                        print(f"sub {idx + 1:03} {sub}")
                 else:
                     print("No submasters")
             case ["tickhz", hz]:
