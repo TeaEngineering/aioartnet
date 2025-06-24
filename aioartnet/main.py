@@ -30,6 +30,8 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--interface")
     parser.add_argument("-n", "--portName")
     parser.add_argument("-p", "--publish", action="store_true")
+    parser.add_argument("-r", "--rdm", action="store_true")
+
     args = parser.parse_args()
 
     level = {False: logging.INFO, True: logging.DEBUG}[args.verbose]
@@ -42,7 +44,7 @@ if __name__ == "__main__":
         kwargs["portName"] = args.portName
     client = ArtNetClient(**kwargs)
     if args.publish:
-        u1 = client.set_port_config("0:0:0", is_input=True)
+        u1 = client.set_port_config("0:0:0", is_input=True, rdm=args.rdm)
         u1.set_dmx(bytes(list(range(128)) * 4))
     asyncio.run(main(client))
     asyncio.get_event_loop().run_forever()
