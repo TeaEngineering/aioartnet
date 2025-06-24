@@ -4,6 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
 
+[tool.ruff]
+
 [tool.ruff.lint]
 extend-select = ["I"]
 
@@ -14,12 +16,12 @@ authors = [
 ]
 description = "Pure Python asyncio connector to Art-Net DMX Universes"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "License :: OSI Approved :: MIT License",
     "Framework :: AsyncIO",
     "Operating System :: OS Independent",
