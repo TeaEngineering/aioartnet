@@ -2,23 +2,16 @@ import argparse
 import asyncio
 import logging
 
-from . import ArtNetClient
+from . import (
+    ArtNetClient,
+)
 
 
 async def main(client: ArtNetClient) -> None:
     await client.connect()
-    # u5 = client.set_port_config("0:0:5", isoutput=True)
 
-    while True:
-        await asyncio.sleep(5)
-        print("nodes:")
-        for n, node in client.nodes.items():
-            print(f" {node!r: <60} {node.ports}")
-        print("universes:")
-        for univ in client.universes.values():
-            print(f" {univ} pubs:{univ.publishers} subs:{univ.subscribers}")
-
-        # print(u5.last_data[0:20].hex())
+    async for event in client.events():
+        print(event)
 
 
 if __name__ == "__main__":

@@ -5,9 +5,24 @@ import re
 import socket
 import struct
 import time
-from collections import defaultdict
-from typing import Any, Optional, Tuple, Union, cast
+from typing import Any, AsyncGenerator, Optional, Union, cast
 
+from .events import (
+    ArtNetEvent,
+    NodeChanged,
+    NodeDiscovered,
+    NodeLost,
+    NodePortAdded,
+    NodePortRemoved,
+    UniverseDiscovered,
+)
+from .models import (
+    DMX_UNIVERSE_SIZE,
+    ArtNetNode,
+    ArtNetPort,
+    ArtNetUniverse,
+    DatagramAddr,
+)
 from .network import AF_PACKET, getifaddrs
 
 # Art-Net implementation for Python asyncio
@@ -21,7 +36,6 @@ from .network import AF_PACKET, getifaddrs
 ARTNET_PORT = 6454
 ARTNET_PREFIX = bytes("Art-Net".encode() + b"\000")
 
-DMX_UNIVERSE_SIZE = 512
 
 # We need to interrogate network interfaces to check which are configured for IP and
 # have a valid broadcast address. For unix-like systems this is fone with socket fnctl
@@ -73,87 +87,6 @@ def swap16(x: int) -> int:
 # Each set fixes a single net and sub_net value, however the choice
 # of universe nibble is determined per-port (net:sub_net:universe).
 
-DGAddr = tuple[Union[str, Any], int]
-
-
-class ArtNetNode:
-    def __init__(
-        self,
-        longName: str,
-        portName: str,
-        style: int,
-        ip: str,
-        udpport: int,
-    ) -> None:
-        self.portName = portName
-        self.longName = longName
-        self._portBinds: defaultdict[int, list[ArtNetPort]] = defaultdict(list)
-        self.ports: list[ArtNetPort] = []
-        self.style: int = style
-        self.udpport = udpport
-        self.ip = ip
-        self.last_reply: float = 0.0
-
-    def __repr__(self) -> str:
-        return f"ArtNetNode<{self.portName},{self.ip}:{self.udpport}>"
-
-
-class ArtNetUniverse:
-    def __init__(self, portaddress: int, client: "ArtNetClient"):
-        if portaddress > 0x7FFF:
-            raise ValueError("Invalid net:subnet:universe, as net>128")
-        self.portaddress = portaddress
-        self.publishers: list[ArtNetNode] = list()
-        self.subscribers: list[ArtNetNode] = list()
-        self.last_data = bytearray(DMX_UNIVERSE_SIZE)
-        self._last_seq = 1
-        self._last_publish: float = 0.0
-        self.publisherseq: dict[Tuple[DGAddr, int], int] = {}
-        self._client = client
-
-    def split(self) -> Tuple[int, int, int]:
-        # name  net:sub_net:universe
-        # bits  8:15  4:8     0:4
-        net = self.portaddress >> 8
-        sub_net = (self.portaddress >> 4) & 0x0F
-        universe = self.portaddress & 0x0F
-        return net, sub_net, universe
-
-    def __repr__(self) -> str:
-        net, sub_net, universe = self.split()
-        return f"{net}:{sub_net}:{universe}"
-
-    def set_dmx(self, data: bytes) -> None:
-        assert len(data) == DMX_UNIVERSE_SIZE
-        self.last_data[:] = data[:]
-        self._client._send_dmx(self)
-
-    def get_dmx(self) -> bytes:
-        return self.last_data
-
-
-class ArtNetPort:
-    def __init__(
-        self,
-        node: Union[ArtNetNode, "ArtNetClient"],
-        is_input: bool,
-        media: int,
-        portaddr: int,
-        universe: ArtNetUniverse,
-    ):
-        self.node = node
-        self.is_input = is_input
-        self.media = 0
-        self.portaddr = portaddr
-        self.universe = universe
-
-    def __repr__(self) -> str:
-        inout = {True: "Input", False: "Output"}[self.is_input]
-        media = ["DMX", "MIDI", "Avab", "Colortran CMX", "ADB 62.5", "Art-Net", "DALI"][
-            self.media
-        ]
-        return f"Port<{inout},{media},{self.universe}>"
-
 
 class ArtNetClientProtocol(asyncio.DatagramProtocol):
     def __init__(self, client: "ArtNetClient"):
@@ -174,7 +107,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         if sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    def datagram_received(self, data: bytes, addr: DGAddr) -> None:
+    def datagram_received(self, data: bytes, addr: DatagramAddr) -> None:
         if data[0:8] == ARTNET_PREFIX:
             (opcode,) = struct.unpack("H", data[8:10])
             h = self.handlers.get(opcode, None)
@@ -187,7 +120,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         else:
             logger.debug(f"Received non Art-Net data from {addr}: {data!r}")
 
-    def on_art_poll(self, addr: DGAddr, data: bytes) -> None:
+    def on_art_poll(self, addr: DatagramAddr, data: bytes) -> None:
         ver, flags, priority = struct.unpack("<HBB", data)
         ver = swap16(ver)
         logger.debug(
@@ -195,7 +128,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         )
         self.send_art_poll_reply()
 
-    def on_art_poll_reply(self, addr: DGAddr, data: bytes) -> None:
+    def on_art_poll_reply(self, addr: DatagramAddr, data: bytes) -> None:
         # everything up to the mac address field is mandatory, the rest must be
         # parsed only if it is sent (field at a time)
         ip, port, fw, netsw, subsw, oemCode = struct.unpack("<IHHBBH", data[0:12])
@@ -252,11 +185,10 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
                 portName=portName,
                 style=style,
             )
-            if changed:
-                logger.debug(f"change detected: from {nn} to {newnode}")
 
-            # TODO: make client.node observable dict and remove this method
-            self.client.add_node(ip, newnode)
+            self.client.nodes[ip] = newnode
+            e = NodeChanged(node=newnode) if changed else NodeDiscovered(node=newnode)
+            self.client._dispatch_event(e)
             nn = newnode
 
         nn.last_reply = time.time()
@@ -281,26 +213,32 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
 
         # track which 'pages' of port bindings we have seen
         old_ports = nn._portBinds[bindindex]
+
+        # print(f"{nn} desired bindindex={bindindex} of {portList}, existing {old_ports}")
         for p in portList:
             if p not in old_ports:
+                logging.debug(f"node {nn} added port {p}")
                 nn.ports.append(p)
                 nn._portBinds[bindindex].append(p)
                 {True: p.universe.publishers, False: p.universe.subscribers}[
                     p.is_input
                 ].append(nn)
+                self.client._dispatch_event(NodePortAdded(node=nn, port=p))
 
         for p in list(old_ports):
             if p not in portList:
+                logging.debug(f"node {nn} removed port {p}")
                 nn.ports.remove(p)
                 nn._portBinds[bindindex].remove(p)
                 {True: p.universe.publishers, False: p.universe.subscribers}[
                     p.is_input
                 ].remove(nn)
+                self.client._dispatch_event(NodePortRemoved(node=nn, port=p))
         logger.debug(
             f"Received Art-Net PollReply from {ip} fw {fw} portName {portName} longName: {longName} bindindex {bindindex} ports:{portList}"
         )
 
-    def on_art_dmx(self, addr: DGAddr, data: bytes) -> None:
+    def on_art_dmx(self, addr: DatagramAddr, data: bytes) -> None:
         ver, seq, phys, sub, net, chlen = struct.unpack("<HBBBBH", data[0:8])
         ver = swap16(ver)
         chlen = swap16(chlen)
@@ -351,6 +289,11 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
 
             if t > self._last_poll + 2.0:
                 self._send_art_poll()
+
+            for ip, node in list(self.client.nodes.items()):
+                if t > node.last_reply + 120:
+                    self.client.nodes.pop(ip, None)
+                    self.client._dispatch_event(NodeLost(node=node))
 
     def _send_art_poll(self) -> None:
         self._last_poll = time.time()
@@ -515,6 +458,8 @@ class ArtNetClient:
         self.interface: Optional[str] = interface
         self._task: Optional[asyncio.Task[None]] = None
 
+        self._event_listeners: list[asyncio.Queue[ArtNetEvent]] = []
+
     async def connect(self) -> asyncio.DatagramTransport:
         loop = asyncio.get_running_loop()
 
@@ -569,9 +514,6 @@ class ArtNetClient:
     def get_nodes(self) -> list[ArtNetNode]:
         return list(self.nodes.values())
 
-    def add_node(self, ip: int, node: ArtNetNode) -> None:
-        self.nodes[ip] = node
-
     def _parse_universe(self, universe: UniverseKey) -> int:
         if isinstance(universe, str):
             # parse to int
@@ -611,7 +553,7 @@ class ArtNetClient:
 
         if is_input or is_output:
             port = ArtNetPort(
-                node=self, is_input=is_input, media=0, portaddr=port_addr, universe=u
+                node=None, is_input=is_input, media=0, portaddr=port_addr, universe=u
             )
             self.ports.append(port)
             logger.debug(f"configured own port {port}")
@@ -639,7 +581,24 @@ class ArtNetClient:
         if (u := self.universes.get(port_addr, None)) is None:
             u = ArtNetUniverse(port_addr, self)
             self.universes[port_addr] = u
+            self._dispatch_event(UniverseDiscovered(universe=u))
         return u
+
+    # EVENT LISTENERS
+    async def events(self) -> AsyncGenerator[ArtNetEvent, None]:
+        q: asyncio.Queue[ArtNetEvent] = asyncio.Queue()
+        self._event_listeners.append(q)
+        try:
+            while True:
+                yield await q.get()
+        finally:
+            self._event_listeners.remove(q)
+
+    def _dispatch_event(self, event: ArtNetEvent) -> None:
+        for q in self._event_listeners:
+            q.put_nowait(event)
+        # for .on() .off() support
+        # text = event.text
 
     # MUTABLE PROPERTIES
     # if you need to change a lot of properties in bulk, set client.passive=True,

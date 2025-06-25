@@ -29,7 +29,6 @@ Use `pip` to install [the package from pypi](https://pypi.org/project/aioartnet/
 There is a built in command-line lighting console for quick Art-Net testing, which maps channels 1:1 to a single universe:
 
     $ python -m aioartnet.console --universe 0:0:0
-    INFO:aioartnet:configured own port Port<Input,DMX,0:0:0>
     INFO:aioartnet:preferred interfaces: [(1, 'wlp4s0'), (10, 'br-ee82b9af434e'), (10, 'docker0'), (10, 'lo'), (10, 'lxdbr0')]
     INFO:aioartnet:using interface wlp4s0 with ip 192.168.1.204 broadcast ip 192.168.1.255, listening on 0.0.0.0 our mac 4485009be628
     > live on

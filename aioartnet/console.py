@@ -307,6 +307,12 @@ async def main(client: ArtNetClient, engine: Engine, interpreter: Interpreter) -
     await client.connect()
     await engine.start_ticking()
 
+    async def print_events() -> None:
+        async for event in client.events():
+            print(event)
+
+    t = asyncio.create_task(print_events())
+
     # Run echo loop. Read text from stdin, and reply it back.
     while True:
         try:
@@ -324,6 +330,8 @@ async def main(client: ArtNetClient, engine: Engine, interpreter: Interpreter) -
             break
         except Exception:
             traceback.print_exc(limit=-2)
+
+    t.cancel()
     return None
 
 
