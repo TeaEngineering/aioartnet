@@ -1,4 +1,0 @@
-prompt_toolkit==3.0.51
-pytest
-pytest-asyncio
-mypy==1.10.0

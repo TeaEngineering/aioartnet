@@ -12,7 +12,7 @@ We also have a propriety iOS/Xcode component available for commercial licensing 
 Install & Demo
 ====
 
-Use `pip` to install [the package from pypi](https://pypi.org/project/aioartnet/):
+Use `pip` to install [the package from pypi](https://pypi.org/project/aioartnet/). Running `aioartnet.main` will show other nodes and universes discovered:
 
     $ pip install aioartnet
     $ python -m aioartnet.main
@@ -28,8 +28,27 @@ Use `pip` to install [the package from pypi](https://pypi.org/project/aioartnet/
      0:0:5 pubs:[] subs:[ArtNetNode<aioartnet,192.168.1.205:6454>]
      0:0:0 pubs:[] subs:[ArtNetNode<ODE Mk3,192.168.1.238:6454>]
 
+There is a built in command-line lighting console for quick Art-Net testing, which maps channels 1:1 to a single universe:
 
-Getting Started
+    $ python -m aioartnet.console --universe 0:0:0
+    INFO:aioartnet:configured own port Port<Input,DMX,0:0:0>
+    INFO:aioartnet:preferred interfaces: [(1, 'wlp4s0'), (10, 'br-ee82b9af434e'), (10, 'docker0'), (10, 'lo'), (10, 'lxdbr0')]
+    INFO:aioartnet:using interface wlp4s0 with ip 192.168.1.204 broadcast ip 192.168.1.255, listening on 0.0.0.0 our mac 4485009be628
+    > live on
+    > ch 1 at f
+    > record cue 1
+    > ch 2 at f
+    > record cue 2
+    > go
+    activated ActiveCue(cue=Cue(name='', fade_in=0, hold=1, fade_out=0, channels=[ChannelIntensity(channel=0, intensity=255)]), since=1750845334.3249245, state=<FadeState.FADE_IN: 2>)
+    finished ActiveCue(cue=Cue(name='', fade_in=0, hold=1, fade_out=0, channels=[ChannelIntensity(channel=0, intensity=255)]), since=1750845334.3249245, state=<FadeState.OFF: 1>)
+    > go
+    activated ActiveCue(cue=Cue(name='', fade_in=0, hold=1, fade_out=0, channels=[ChannelIntensity(channel=1, intensity=255)]), since=1750845336.5779428, state=<FadeState.FADE_IN: 2>)
+    finished ActiveCue(cue=Cue(name='', fade_in=0, hold=1, fade_out=0, channels=[ChannelIntensity(channel=1, intensity=255)]), since=1750845336.5779428, state=<FadeState.OFF: 1>)
+    > [ctl-C]
+
+
+Getting Started - Code
 ====
 
 1) Import the library and create an `ArtNetClient`

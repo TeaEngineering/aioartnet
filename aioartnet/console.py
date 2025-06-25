@@ -99,6 +99,11 @@ class Engine:
         for ac in self._active_cues:
             intensity = ac.get_update_intensity(self.last_poll)
             apply_ci(live, ac.cue.channels, scale=intensity)
+
+        for ac in self._active_cues:
+            if ac.state == FadeState.OFF:
+                print(f"finished {ac}")
+
         self._active_cues[:] = [
             x for x in self._active_cues if x.state != FadeState.OFF
         ]
@@ -128,7 +133,8 @@ class Engine:
 
     def activate(self, cue: Cue) -> None:
         # activates a cue, with the start time of our last poll
-        self._active_cues.append(ActiveCue(since=self.last_poll, cue=cue))
+        self._active_cues.append(ac := ActiveCue(since=self.last_poll, cue=cue))
+        print(f"activated {ac}")
 
     async def stop(self) -> None:
         self.active_cue = None
