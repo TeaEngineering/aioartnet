@@ -607,14 +607,14 @@ class ArtNetClient:
                 break
         if port:
             self.ports.remove(port)
-            logger.info(f"removed own port {port}")
+            logger.debug(f"removed own port {port}")
 
         if is_input or is_output:
             port = ArtNetPort(
                 node=self, is_input=is_input, media=0, portaddr=port_addr, universe=u
             )
             self.ports.append(port)
-            logger.info(f"configured own port {port}")
+            logger.debug(f"configured own port {port}")
 
         # TODO: optimise the layour of self.ports to self._portBinds
         # up to four ports with a common (net,sub-net) can be listed on the same page
