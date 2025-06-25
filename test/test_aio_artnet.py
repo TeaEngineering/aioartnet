@@ -11,7 +11,8 @@ from aioartnet import (
     ArtNetClient,
     ArtNetUniverse,
 )
-from aioartnet.aio_artnet import ArtNetClientProtocol, DGAddr
+from aioartnet.client import ArtNetClientProtocol
+from aioartnet.models import DatagramAddr
 
 
 def test_universe() -> None:
@@ -50,12 +51,12 @@ def packet_reader(file: str) -> Iterator[Tuple[float, bytes]]:
 
 class MockTransport(BaseTransport):
     def __init__(self) -> None:
-        self.sent: list[tuple[bytes, DGAddr]] = []
+        self.sent: list[tuple[bytes, DatagramAddr]] = []
 
     def get_extra_info(self, name: str, default: Any = None) -> Any:
         return None
 
-    def sendto(self, data: bytes, addr: DGAddr) -> None:
+    def sendto(self, data: bytes, addr: DatagramAddr) -> None:
         self.sent.append((data, addr))
 
 
@@ -150,7 +151,7 @@ class BroadcastTransport(BaseTransport):
     def get_extra_info(self, name: str, default: Any = None) -> Any:
         return None
 
-    def sendto(self, data: bytes, addr: DGAddr) -> None:
+    def sendto(self, data: bytes, addr: DatagramAddr) -> None:
         self.pending.append((data, addr))
 
     def drain(self) -> None:
