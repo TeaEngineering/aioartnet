@@ -66,6 +66,16 @@ class ArtNetUniverse:
     def get_dmx(self) -> bytes:
         return self.last_data
 
+    # eq/hash based on portaddress only
+    def __hash__(self) -> int:
+        return hash(self.portaddress)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, self.__class__):
+            return self.portaddress == other.portaddress
+        else:
+            return False
+
 
 @dataclass
 class ArtNetPort:

@@ -51,4 +51,4 @@ class UniverseDiscovered(ArtNetEvent):
 class UniverseDMX(ArtNetEvent):
     universe: ArtNetUniverse
     data: bytes
-    text: str = field(init=False, repr=False, default="universe-added")
+    text: str = field(init=False, repr=False, default="universe-dmx")

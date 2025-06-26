@@ -1,3 +1,4 @@
+import asyncio
 import socket
 import struct
 from asyncio import BaseTransport
@@ -12,6 +13,14 @@ from aioartnet import (
     ArtNetUniverse,
 )
 from aioartnet.client import ArtNetClientProtocol
+from aioartnet.events import (
+    ArtNetEvent,
+    NodeChanged,
+    NodeDiscovered,
+    NodePortAdded,
+    UniverseDiscovered,
+    UniverseDMX,
+)
 from aioartnet.models import DatagramAddr
 
 
@@ -161,6 +170,24 @@ class BroadcastTransport(BaseTransport):
                 p.datagram_received(*msg)
 
 
+async def event_consumer(
+    client: ArtNetClient, received_events: list[ArtNetEvent]
+) -> None:
+    async for event in client.events():
+        received_events.append(event)
+        print(f"event_consumer got {event}")
+    print("Consumer task finished.")
+
+
+async def await_events(events: list[ArtNetEvent], count: int) -> list[ArtNetEvent]:
+    # async with asyncio.timeout(2):
+    while len(events) < count:
+        await asyncio.sleep(0)
+    ret = events[:count]
+    events[:count] = []
+    return ret
+
+
 @pytest.mark.asyncio
 async def test_artnet_back_to_back_nodes() -> None:
     # use two instances of our client linked by a mock transport to test
@@ -173,6 +200,11 @@ async def test_artnet_back_to_back_nodes() -> None:
     clB = ArtNetClient(interface="dummy", portName="bravo")
     clB.broadcast_ip = "10.10.10.255"
     clB.unicast_ip = "10.10.10.2"
+    events: list[ArtNetEvent] = []
+
+    consumer_task = asyncio.create_task(event_consumer(clB, events))
+    while len(clB._event_listeners) == 0:
+        await asyncio.sleep(0)
 
     protoA = ArtNetClientProtocol(clA)
     protoB = ArtNetClientProtocol(clB)
@@ -189,6 +221,10 @@ async def test_artnet_back_to_back_nodes() -> None:
         == "[ArtNetNode<alpha,10.10.10.10:6454>, ArtNetNode<bravo,10.10.10.2:6454>]"
     )
 
+    na, nb = await await_events(events, 2)
+    assert isinstance(na, NodeDiscovered)
+    assert isinstance(nb, NodeDiscovered)
+
     # when a client has a property modified, it automatically sends an unsolicited PollReply
     clB.portName = "charlie"
     assert len(transport.pending) == 1
@@ -202,6 +238,35 @@ async def test_artnet_back_to_back_nodes() -> None:
         str(list(clB.nodes.values()))
         == "[ArtNetNode<alpha,10.10.10.10:6454>, ArtNetNode<charlie,10.10.10.2:6454>]"
     )
+
+    (nc,) = await await_events(events, 1)
+    assert isinstance(nc, NodeChanged)
+
+    u1p = clA.set_port_config("2:2:2", is_input=True)
+    u1s = clB.set_port_config("2:2:2", is_output=True)
+    transport.drain()
+
+    euniv, npa1, npa2 = await await_events(events, 3)
+    assert isinstance(euniv, UniverseDiscovered)
+    assert isinstance(npa1, NodePortAdded)
+    assert isinstance(npa2, NodePortAdded)
+
+    test_pattern = bytearray(512)
+    test_pattern[1] = 255
+    u1p.set_dmx(test_pattern)
+    transport.drain()
+
+    assert u1s.get_dmx() == test_pattern
+    (dmx1,) = await await_events(events, 1)
+    assert isinstance(dmx1, UniverseDMX)
+    assert dmx1.data == test_pattern
+
+    consumer_task.cancel()
+    try:
+        await consumer_task
+    except asyncio.CancelledError:
+        # expected
+        pass
 
 
 @pytest.mark.asyncio
