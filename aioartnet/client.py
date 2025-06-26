@@ -15,6 +15,7 @@ from .events import (
     NodePortAdded,
     NodePortRemoved,
     UniverseDiscovered,
+    UniverseDMX,
 )
 from .models import (
     DMX_UNIVERSE_SIZE,
@@ -175,8 +176,8 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             changed |= nn.style != style
             logger.debug(f"change detection on {nn} => {changed}")
 
-        # FIXME: what if a node changes ip address?
-
+        # if a node changes ip address, we will send NodeDiscovered, and then
+        # eventually the old node gets timed out NodeLost
         if nn is None or changed:
             newnode = ArtNetNode(
                 ip=f"{ipa}",
@@ -185,9 +186,9 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
                 portName=portName,
                 style=style,
             )
-
             self.client.nodes[ip] = newnode
             e = NodeChanged(node=newnode) if changed else NodeDiscovered(node=newnode)
+            logger.debug(f"new node created {nn} => {newnode} with {e}")
             self.client._dispatch_event(e)
             nn = newnode
 
@@ -276,7 +277,12 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         # TODO: HTP/LTP merging with Merge Mode, see "Data Merging" spec p61
         # See ArtAddress AcCancelMerge flags spec p39
         # Only two sources are allowed to contribute to the values in the universe
-        u.last_data[0:chlen] = data[8 : 8 + chlen]
+        channel_data = data[8 : 8 + chlen]
+        u.last_data[0:chlen] = channel_data
+
+        # if we are subscribed for this data, create UniverseDMX Event
+        if u in self.client._subscribing:
+            self.client._dispatch_event(UniverseDMX(u, channel_data))
 
     async def art_poll_task(self) -> None:
         while True:
@@ -454,7 +460,8 @@ class ArtNetClient:
         self.mac: bytes = b"\01\22\33\44\55\66"
 
         self.protocol: Optional[ArtNetClientProtocol] = None
-        self._publishing: list[ArtNetUniverse] = []
+        self._publishing: set[ArtNetUniverse] = set()
+        self._subscribing: set[ArtNetUniverse] = set()
         self.interface: Optional[str] = interface
         self._task: Optional[asyncio.Task[None]] = None
 
@@ -567,10 +574,12 @@ class ArtNetClient:
             self._portBinds = {1: []}
 
         # used for the timer-based DMX repeating
-        if u in self._publishing:
-            self._publishing.remove(u)
+        self._publishing.discard(u)
+        self._subscribing.discard(u)
         if is_input:
-            self._publishing.append(u)
+            self._publishing.add(u)
+        if is_output:
+            self._subscribing.add(u)
 
         if not self.passive and self.protocol:
             self.protocol.send_art_poll_reply()
