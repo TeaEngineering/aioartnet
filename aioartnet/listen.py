@@ -18,12 +18,12 @@ from .events import ArtNetEvent, UniverseDMX
 
 
 async def main(client: ArtNetClient) -> None:
-    dmxstr = ["Waiting for DMX data"]
+    dmx_str = "Waiting for DMX data"
     history: deque[ArtNetEvent] = deque([], maxlen=10)
     await client.connect()
 
     def get_formatted_universe() -> HTML:
-        return HTML(dmxstr[0])
+        return HTML(dmx_str)
 
     def get_event_history() -> HTML:
         return HTML("events: \n" + "\n".join(html.escape(str(p)) for p in history))
@@ -38,7 +38,7 @@ async def main(client: ArtNetClient) -> None:
         event.app.exit()
 
     # Define the top UI window for displaying the DMX universe.
-    dir_listing_window = Window(
+    universe_window = Window(
         content=FormattedTextControl(get_formatted_universe),
         wrap_lines=True,
         style="bg:#262626 fg:#FFFFFF",  # Background: dark gray, Foreground: white
@@ -61,7 +61,7 @@ async def main(client: ArtNetClient) -> None:
         layout=Layout(
             HSplit(
                 [
-                    dir_listing_window,
+                    universe_window,
                     event_window,
                     status_bar,
                 ]
@@ -71,12 +71,13 @@ async def main(client: ArtNetClient) -> None:
         full_screen=True,
     )
 
-    async def handler_task(history: deque[ArtNetEvent], dmxstr: list[str]) -> None:
+    async def handler_task(history: deque[ArtNetEvent]) -> None:
+        nonlocal dmx_str
         async for event in client.events():
             match event:
                 case UniverseDMX():
                     hs = event.data.hex()
-                    dmxstr[0] = f"Universe {event.universe}\n" + " ".join(
+                    dmx_str = f"Universe {event.universe}\n" + " ".join(
                         [hs[i : i + 2] for i in range(0, len(hs), 2)]
                     )
                 case _:
@@ -84,13 +85,16 @@ async def main(client: ArtNetClient) -> None:
 
             application.invalidate()
 
-    task = asyncio.create_task(handler_task(history, dmxstr))
+    task = asyncio.create_task(handler_task(history))
 
-    await (
-        application.run_async()
-    )  # Run the prompt_toolkit application, blocking until exited
+    await application.run_async()
+
+    # Cancel event listener
     task.cancel()
-    await task
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 if __name__ == "__main__":
@@ -100,7 +104,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("-i", "--interface")
-    parser.add_argument("-n", "--portName")
+    parser.add_argument("-n", "--port-name")
     parser.add_argument("universe", nargs="+", help="universes to view")
 
     args = parser.parse_args()
@@ -111,7 +115,7 @@ if __name__ == "__main__":
     kwargs = {}
     if args.interface:
         kwargs["interface"] = args.interface
-    if args.portName:
+    if args.port_name:
         kwargs["portName"] = args.portName
     client = ArtNetClient(**kwargs)
 
