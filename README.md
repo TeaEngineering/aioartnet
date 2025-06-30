@@ -159,9 +159,8 @@ DMX Remote Device Management (RDM) Support
 
 The Art-Net protocol can carry RDM messages to allow for table-of-device enumeration, and then inspection of the devices by uid.
 
-https://www.rdmprotocol.org/rdm/wp-content/uploads/2011/09/logo2.jpg
-
 See https://www.rdmprotocol.org/rdm/
 
-RDM specs are https://tsp.esta.org/tsp/documents/published_docs.php
+![RDM-DMX logo](./docs/rdm-dmx-logo.jpg)
 
+RDM specs are https://tsp.esta.org/tsp/documents/published_docs.php
