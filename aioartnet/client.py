@@ -25,6 +25,7 @@ from .models import (
     DatagramAddr,
 )
 from .network import AF_PACKET, getifaddrs
+from .rdm import RDMDevice
 
 # Art-Net implementation for Python asyncio
 # Any page references to 'spec' refer to
@@ -98,6 +99,8 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             0x2000: self.on_art_poll,
             0x2100: self.on_art_poll_reply,
             0x5000: self.on_art_dmx,
+            0x8000: self.on_art_tod_request,
+            0x8100: self.on_art_tod_data,
         }
         client.protocol = self
         self.node_report_counter = 0
@@ -115,7 +118,7 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             if h:
                 h(addr, data[10:])
             else:
-                logger.debug(
+                logger.info(
                     f"Received unsupported Art-Net: op {hex(opcode)} from {addr}: {data[10:]!r}"
                 )
         else:
@@ -196,7 +199,9 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
 
         # iterate through the ports and create ports and universes
         portList = []
-        for _type, _in, _out, _swin, _swout in zip(ptype, ins, outs, swin, swout):
+        for _type, _in, _out, _swin, _swout, _goodout in zip(
+            ptype, ins, outs, swin, swout, goodout
+        ):
             in_port_addr = (
                 ((netsw & 0x7F) << 8) + ((subsw & 0x0F) << 4) + (_swin & 0x0F)
             )
@@ -206,11 +211,13 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             if _type & 0b10000000:
                 outu = self.client._get_create_universe(out_port_addr)
                 portList.append(
-                    ArtNetPort(nn, False, _type & 0x1F, out_port_addr, outu)
+                    ArtNetPort(nn, False, _type & 0x1F, out_port_addr, outu, _goodout)
                 )
             if _type & 0b01000000:
                 inu = self.client._get_create_universe(in_port_addr)
-                portList.append(ArtNetPort(nn, True, _type & 0x1F, in_port_addr, inu))
+                portList.append(
+                    ArtNetPort(nn, True, _type & 0x1F, in_port_addr, inu, 0)
+                )
 
         # track which 'pages' of port bindings we have seen
         old_ports = nn._portBinds[bindindex]
@@ -284,6 +291,44 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         if u in self.client._subscribing:
             self.client._dispatch_event(UniverseDMX(u, channel_data))
 
+    def on_art_tod_request(self, addr: DatagramAddr, data: bytes) -> None:
+        (ver,) = struct.unpack("<H", data[0:2])
+        net = data[11]
+        cmd = data[12]
+        address_count = data[13]
+        # net+address => universe address
+        for universe in [int(x) + net << 8 for x in data[14 : 14 + address_count]]:
+            logger.debug(
+                f"Received Art-Net TOD request: ver {ver} cmd {cmd} universe {universe} from {addr}"
+            )
+            # TODO: if we are an output, answer this with our cached tod table by sending
+            # art_tod_data packets
+
+    def on_art_tod_data(self, addr: DatagramAddr, data: bytes) -> None:
+        ver, rdm_ver, port = struct.unpack("<HBB", data[0:4])
+        # 6 bytes spare
+        bind_index, net, response, address, tot_uid, block_count, uid_count = (
+            struct.unpack("<BBBBHBB", data[10:18])
+        )
+        portaddress = net << 8 + address
+        TOD_FULL = 0
+
+        if response != TOD_FULL:
+            logger.info(
+                "Got unexpected art_tod_data with response {response} from {addr}"
+            )
+            return
+
+        u = self.client._get_create_universe(portaddress)
+
+        # I think tot_uid and block_count are *paging* related if more tod UIDs than can fit in a packet
+        for i in range(uid_count):
+            uid = data[18 + i * 6 : 18 + (i + 1) * 6]
+            u._tod[uid] = RDMDevice(uid)
+            logger.info(
+                f"Received Art-Net TOD entry: universe {portaddress} uid={uid.hex()} from {addr}"
+            )
+
     async def art_poll_task(self) -> None:
         while True:
             await asyncio.sleep(0.1)
@@ -292,6 +337,8 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
             for u in self.client._publishing:
                 if t > u._last_publish + 1.0:
                     self._send_art_dmx(u)
+                if t > u._last_tod_request + 5.0:
+                    self._send_art_tod_request(u)
 
             if t > self._last_poll + 2.0:
                 self._send_art_poll()
@@ -422,6 +469,37 @@ class ArtNetClientProtocol(asyncio.DatagramProtocol):
         if self.transport:
             self.transport.sendto(message, addr=(node.ip, node.udpport))
 
+    def _send_art_tod_request(self, universe: ArtNetUniverse) -> None:
+        logger.debug(f"sending art tod request for {universe}")
+        universe._last_tod_request = time.time()
+
+        subuni = universe.portaddress & 0xFF
+        net = universe.portaddress >> 8
+        message = ARTNET_PREFIX + struct.pack(
+            "<HBBBBBBBBBBBBBBB",
+            0x8000,
+            0,
+            14,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            net,
+            0,  # command TodFull
+            1,
+            subuni,
+        )
+
+        if self.transport:
+            # send direct to node?
+            #    self.transport.sendto(message, addr=(node.ip, node.udpport))
+            self.transport.sendto(message, addr=(self.client.broadcast_ip, ARTNET_PORT))
+
     def error_received(self, exc: Exception) -> None:
         logger.warn("Error received:", exc)
 
@@ -540,6 +618,7 @@ class ArtNetClient:
         universe: UniverseKey,
         is_input: bool = False,
         is_output: bool = False,
+        rdm: bool = False,
     ) -> ArtNetUniverse:
         port_addr = self._parse_universe(universe)
 
@@ -560,7 +639,12 @@ class ArtNetClient:
 
         if is_input or is_output:
             port = ArtNetPort(
-                node=None, is_input=is_input, media=0, portaddr=port_addr, universe=u
+                node=None,
+                is_input=is_input,
+                media=0,
+                portaddr=port_addr,
+                universe=u,
+                flags=0,
             )
             self.ports.append(port)
             logger.debug(f"configured own port {port}")
