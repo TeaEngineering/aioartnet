@@ -313,3 +313,133 @@ async def test_load_commands_skips_blanks_and_tolerates_errors(tmp_path) -> None
 
     # the valid commands either side of the broken line both applied
     assert len(engine.subs) == 2
+
+
+def _fixture_profiles():  # type: ignore[no-untyped-def]
+    from aioartnet.console import load_profiles
+
+    return load_profiles(
+        {
+            "fixtures": {
+                "rgba_wash": ["dimmer", "red", "green", "blue", "amber"],
+                "star_wash_bl": [
+                    "pan",
+                    "tilt",
+                    "dimmer",
+                    "red",
+                    "green",
+                    "blue",
+                    "white",
+                    {"gobo": {"open": 0, "stars": 50, "moon": 100}},
+                ],
+            }
+        }
+    )
+
+
+def _edits(engine: Engine) -> dict:  # type: ignore[type-arg]
+    return {ci.channel: ci.intensity for ci in engine.edits}
+
+
+@pytest.mark.asyncio
+async def test_fixture_patch_strides_by_footprint() -> None:
+    engine = Engine(Mock(), universe_size=200)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    await it.on_cmd("patch rgba_wash wash 1 thru 6 @ 1")  # footprint 5
+
+    assert it.fixtures[("wash", 1)].base == 0  # DMX 1
+    assert it.fixtures[("wash", 3)].base == 10  # DMX 11
+    assert it.fixtures[("wash", 6)].base == 25  # DMX 26
+
+
+@pytest.mark.asyncio
+async def test_fixture_color_sets_rgb_only() -> None:
+    engine = Engine(Mock(), universe_size=200)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    await it.on_cmd("patch rgba_wash wash 1 @ 1")
+    await it.on_cmd("fix wash 1 color #ff8800")
+
+    e = _edits(engine)
+    assert (e[1], e[2], e[3]) == (255, 136, 0)  # red, green, blue
+    assert 4 not in e  # amber untouched
+    assert 0 not in e  # dimmer untouched
+
+    await it.on_cmd("fix wash 1 at full")
+    assert _edits(engine)[0] == 255  # dimmer
+
+
+@pytest.mark.asyncio
+async def test_fixture_macro_and_literal() -> None:
+    engine = Engine(Mock(), universe_size=200)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    await it.on_cmd("patch star_wash_bl head 1 @ 1")  # gobo at offset 7 -> chan 7
+
+    await it.on_cmd("fix head 1 gobo stars")
+    assert _edits(engine)[7] == 50  # macro resolves to its raw byte
+
+    await it.on_cmd("fix head 1 gobo 60")
+    assert _edits(engine)[7] == 60  # bare number is a literal byte on raw channel
+
+
+@pytest.mark.asyncio
+async def test_fixture_group_and_mixed_selector() -> None:
+    engine = Engine(Mock(), universe_size=200)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    await it.on_cmd("patch rgba_wash wash 1 thru 2 @ 1")
+    await it.on_cmd("patch star_wash_bl head 1 @ 20")
+    await it.on_cmd("group rig = wash 1 thru 2 head 1")
+
+    await it.on_cmd("fix rig color blue")
+    e = _edits(engine)
+    # wash 1 blue (chan 3) + head 1 blue (base 19 + offset 5 = 24)
+    assert e[3] == 255
+    assert e[24] == 255
+
+
+@pytest.mark.asyncio
+async def test_fixture_save_round_trip() -> None:
+    profiles = _fixture_profiles()
+    src = Interpreter(Engine(Mock(), universe_size=200), profiles=profiles)
+    await src.on_cmd("patch rgba_wash wash 1 thru 6 @ 1")
+    await src.on_cmd("patch star_wash_bl head 1 thru 4 @ 31")
+    await src.on_cmd("group washes = wash 1 thru 6")
+
+    dst = Interpreter(Engine(Mock(), universe_size=200), profiles=profiles)
+    for line in src.serialise():
+        if not line.startswith("#"):
+            await dst.on_cmd(line)
+
+    assert list(dst.fixtures.keys()) == list(src.fixtures.keys())
+    assert dst.fixtures[("head", 2)].base == src.fixtures[("head", 2)].base
+    assert dst.groups == src.groups
+
+
+@pytest.mark.asyncio
+async def test_fixture_default_holds_base_layer() -> None:
+    from aioartnet.console import SRC_DEFAULT, SRC_LIVE, load_profiles
+
+    profiles = load_profiles(
+        {
+            "fixtures": {
+                # global_dimmer (offset 2) defaults to full
+                "head": ["red", "green", {"global_dimmer": 255}],
+            }
+        }
+    )
+    out: dict[int, int] = {}
+    engine = Engine(lambda d: out.update(enumerate(d)), universe_size=20)
+    it = Interpreter(engine, profiles=profiles)
+    await it.on_cmd("patch head h 1 thru 2 @ 1")  # footprint 3 -> base 0, 3
+
+    await engine.poll(0)
+    assert engine.base[2] == 255  # h1 global_dimmer
+    assert engine.base[5] == 255  # h2 global_dimmer
+    assert out[2] == 255  # held in the output beneath everything
+    assert engine.last_source[2] == SRC_DEFAULT
+    assert engine.last_source[0] == 0  # undriven (no default)
+
+    # a live edit overrides the default and reads as a live channel
+    await it.on_cmd("live on")
+    await it.on_cmd("chan 3 at z")  # 1-based chan 3 == index 2
+    assert out[2] == 0
+    assert engine.last_source[2] == SRC_LIVE

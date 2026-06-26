@@ -37,6 +37,10 @@ class ChannelIntensity:
     channel: int
     intensity: int
 
+    def __repr__(self) -> str:
+        # compact, 1-based to match the rest of the console UI, e.g. "5@255"
+        return f"{self.channel + 1}@{self.intensity}"
+
 
 @dataclass
 class Cue:
@@ -82,6 +86,7 @@ class ActiveCue:
 SRC_UNDRIVEN = 0  # nothing active touches this channel
 SRC_STORED = 1  # held by an active cue or submaster
 SRC_LIVE = 2  # overridden by a live edit
+SRC_DEFAULT = 3  # held at a fixture profile default (base layer)
 
 
 def apply_ci(
@@ -106,6 +111,8 @@ class Engine:
         # an index into cues[] of our current playback position, or None if stopped
         self.active_cue: int | None = None
         self.subs: list[Submaster] = []
+        # base layer: fixture profile defaults, output beneath cues/subs/edits
+        self.base = bytearray(universe_size)
         self.live = bytearray(universe_size)
         # per-channel SRC_* provenance for the most recent poll
         self.last_source = bytearray(universe_size)
@@ -120,7 +127,8 @@ class Engine:
         # advance time
         self.last_poll = max(self.last_poll, time)
 
-        live = bytearray(self.universe_size)
+        # start from the base layer (fixture profile defaults)
+        live = bytearray(self.base)
         # every cue is either off, fade-in, hold, or fade-out
         for ac in self._active_cues:
             intensity = ac.get_update_intensity(self.last_poll)
@@ -144,8 +152,10 @@ class Engine:
             apply_ci(live, self.edits, 1.0)
 
         # classify the provenance of each channel, mirroring the mix order
-        # above: cues/subs are "stored", live edits override as "live"
-        source = bytearray(self.universe_size)
+        # above: base defaults are lowest, then cues/subs "stored", edits "live"
+        source = bytearray(
+            SRC_DEFAULT if b else SRC_UNDRIVEN for b in self.base
+        )
         for ac in self._active_cues:
             for e in ac.cue.channels:
                 source[e.channel] = SRC_STORED
@@ -364,6 +374,97 @@ def parse_duration(value: str) -> int:
     return int(value)
 
 
+NAMED_COLORS: dict[str, tuple[int, int, int]] = {
+    "red": (255, 0, 0),
+    "green": (0, 255, 0),
+    "blue": (0, 0, 255),
+    "white": (255, 255, 255),
+    "amber": (255, 191, 0),
+    "cyan": (0, 255, 255),
+    "magenta": (255, 0, 255),
+    "yellow": (255, 255, 0),
+    "black": (0, 0, 0),
+    "off": (0, 0, 0),
+}
+
+
+def parse_color(token: str) -> tuple[int, int, int]:
+    """Parse `#rrggbb` or a named colour into a 0-255 RGB triple."""
+    if token.startswith("#") and len(token) == 7:
+        h = token[1:]
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    if token in NAMED_COLORS:
+        return NAMED_COLORS[token]
+    raise ValueError(f"unknown colour {token!r}")
+
+
+@dataclass
+class FixtureProfile:
+    """A fixture personality: the attribute at each channel offset, plus any
+    enumerated (macro) values for raw channels like gobo/strobe."""
+
+    name: str
+    channels: list[str]  # attr name per offset ("-"/"" for unaddressed channels)
+    enums: dict[str, dict[str, int]]  # attr -> {macro name: raw DMX byte}
+    defaults: dict[str, int]  # attr -> base value held beneath cues/subs/edits
+
+    @property
+    def footprint(self) -> int:
+        return len(self.channels)
+
+    def offset(self, attr: str) -> Optional[int]:
+        try:
+            return self.channels.index(attr)
+        except ValueError:
+            return None
+
+
+def parse_profile(name: str, entries: list[Any]) -> FixtureProfile:
+    """Build a FixtureProfile from its config list. Each entry is one of:
+    - a bare attr name:                  "red"
+    - a macro channel (value is a map):  {"gobo": {"open": 0, "stars": 50}}
+    - a defaulted channel (value int):   {"global_dimmer": 255}
+    """
+    channels: list[str] = []
+    enums: dict[str, dict[str, int]] = {}
+    defaults: dict[str, int] = {}
+    for entry in entries:
+        if isinstance(entry, str):
+            channels.append(entry)
+        elif isinstance(entry, dict) and len(entry) == 1:
+            attr, spec = next(iter(entry.items()))
+            channels.append(attr)
+            if isinstance(spec, dict):
+                enums[attr] = {k: int(v) for k, v in spec.items()}
+            elif isinstance(spec, int) and not isinstance(spec, bool):
+                defaults[attr] = min(255, max(0, spec))
+            else:
+                raise ValueError(f"bad channel spec in profile {name}: {entry!r}")
+        else:
+            raise ValueError(f"bad channel entry in profile {name}: {entry!r}")
+    return FixtureProfile(
+        name=name, channels=channels, enums=enums, defaults=defaults
+    )
+
+
+def load_profiles(config: dict[str, Any]) -> dict[str, FixtureProfile]:
+    return {
+        name: parse_profile(name, entries)
+        for name, entries in config.get("fixtures", {}).items()
+    }
+
+
+@dataclass
+class PatchedFixture:
+    """An instance of a profile patched at a base DMX channel (0-based)."""
+
+    kind: str  # profile name
+    label: str  # e.g. "wash"
+    number: int  # 1-based
+    base: int  # 0-based channel of offset 0
+    profile: FixtureProfile
+
+
 class DmxGrid:
     """Renders a live DMX universe as a grid of channel levels.
 
@@ -384,6 +485,7 @@ class DmxGrid:
         SRC_UNDRIVEN: "fg:#b0b0b0",  # light grey
         SRC_STORED: "fg:black",
         SRC_LIVE: "fg:red",
+        SRC_DEFAULT: "fg:#2a6fdb",  # blue: held at a fixture profile default
     }
 
     def __init__(
@@ -500,6 +602,13 @@ Available commands:
             [fade_in D] [fade_out D] [hold D]
   midi bind cc C sub N              bind MIDI CC C to submaster N
   midi bind cc C                    unbind MIDI CC C
+  patch PROFILE LBL N [thru M] @ A  patch fixture(s) of PROFILE at address A
+  group NAME = SELECTOR             name a group of fixtures
+  fix                               list patched fixtures
+  fix SELECTOR ATTR VAL [...]       set fixture attribute(s)
+  fix SELECTOR color #RRGGBB|NAME   set fixture colour (red/green/blue)
+  fix SELECTOR at LEVEL             set fixture dimmer
+            SELECTOR = LBL N | LBL N thru M | group name
   edits|edit|dirty                  show the current uncommitted edits
   go                                advance to the next cue
   back                              return to the previous cue
@@ -519,6 +628,7 @@ class Interpreter:
         engine: Engine,
         grid: Optional[DmxGrid] = None,
         midi: Optional[MidiCC] = None,
+        profiles: Optional[dict[str, FixtureProfile]] = None,
     ):
         self.engine = engine
         self.grid = grid
@@ -529,6 +639,126 @@ class Interpreter:
         self._wired_cc: set[int] = set()
         # path of the show file (from --file); target for a bare `save`
         self.showfile_path: Optional[str] = None
+        # fixture profiles (from config), patched instances, and groups
+        self.profiles = profiles or {}
+        self.fixtures: dict[tuple[str, int], PatchedFixture] = {}
+        self._labels: set[str] = set()  # patched fixture labels, e.g. {"wash"}
+        self.groups: dict[str, list[tuple[str, int]]] = {}
+
+    def _fixture(self, label: str, number: int) -> PatchedFixture:
+        try:
+            return self.fixtures[(label, number)]
+        except KeyError:
+            raise ValueError(f"no fixture {label} {number}")
+
+    def _take_selector(
+        self, tokens: list[str]
+    ) -> tuple[list[PatchedFixture], list[str]]:
+        """Consume a selector from the front of `tokens`: fixture refs
+        (`wash 1`, `wash 1 thru 6`) and group names, in any combination.
+        Returns the resolved fixtures and the unconsumed remainder."""
+        out: list[PatchedFixture] = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok in self.groups:
+                out.extend(self._fixture(lbl, n) for lbl, n in self.groups[tok])
+                i += 1
+            elif tok in self._labels:
+                n1 = int(tokens[i + 1])
+                if i + 2 < len(tokens) and tokens[i + 2] == "thru":
+                    n2 = int(tokens[i + 3])
+                    out.extend(self._fixture(tok, n) for n in range(n1, n2 + 1))
+                    i += 4
+                else:
+                    out.append(self._fixture(tok, n1))
+                    i += 2
+            else:
+                break  # start of the attribute list
+        return out, tokens[i:]
+
+    def _set_attr(self, fx: PatchedFixture, attr: str, token: str) -> None:
+        offset = fx.profile.offset(attr)
+        if offset is None:
+            return  # this fixture has no such attribute (e.g. mixed group)
+        if attr in fx.profile.enums:
+            macros = fx.profile.enums[attr]
+            if token in macros:
+                byte = macros[token]
+            else:
+                try:
+                    byte = min(255, int(token, 0))  # raw channel: literal byte
+                except ValueError:
+                    raise ValueError(f"{attr}: unknown macro {token!r}")
+        else:
+            byte = parse_intensity(token)  # intensity-scaled channel
+        self.engine.add_edit(
+            ChannelIntensity(channel=fx.base + offset, intensity=byte)
+        )
+
+    def _set_channel(self, fx: PatchedFixture, attr: str, byte: int) -> None:
+        offset = fx.profile.offset(attr)
+        if offset is None:
+            return
+        self.engine.add_edit(
+            ChannelIntensity(channel=fx.base + offset, intensity=byte)
+        )
+
+    def _apply_fix(self, fixtures: list[PatchedFixture], tokens: list[str]) -> None:
+        i = 0
+        while i < len(tokens):
+            attr = tokens[i]
+            if attr in ("at", "@"):  # `at` is shorthand for the dimmer channel
+                for fx in fixtures:
+                    self._set_attr(fx, "dimmer", tokens[i + 1])
+                i += 2
+            elif attr == "color":
+                r, g, b = parse_color(tokens[i + 1])
+                for fx in fixtures:
+                    self._set_channel(fx, "red", r)
+                    self._set_channel(fx, "green", g)
+                    self._set_channel(fx, "blue", b)
+                i += 2
+            else:
+                for fx in fixtures:
+                    self._set_attr(fx, attr, tokens[i + 1])
+                i += 2
+
+    def _patch(self, profile: str, label: str, rest: list[str]) -> None:
+        """patch <profile> <label> <n> [thru <m>] @ <base> [step <stride>]"""
+        prof = self.profiles.get(profile)
+        if prof is None:
+            raise ValueError(f"unknown fixture profile {profile!r}")
+        i = 0
+        n1 = int(rest[i])
+        n2 = n1
+        i += 1
+        if i < len(rest) and rest[i] == "thru":
+            n2 = int(rest[i + 1])
+            i += 2
+        if i >= len(rest) or rest[i] not in ("@", "at"):
+            raise ValueError("patch needs '@ <base address>'")
+        base = int(rest[i + 1]) - 1  # 1-based DMX address -> 0-based channel
+        i += 2
+        stride = prof.footprint
+        if i < len(rest) and rest[i] == "step":
+            stride = int(rest[i + 1])
+            i += 2
+        for k, number in enumerate(range(n1, n2 + 1)):
+            fx = PatchedFixture(
+                kind=profile,
+                label=label,
+                number=number,
+                base=base + k * stride,
+                profile=prof,
+            )
+            self.fixtures[(label, number)] = fx
+            # seed the engine base layer with this fixture's channel defaults
+            for attr, value in prof.defaults.items():
+                offset = prof.offset(attr)
+                if offset is not None:
+                    self.engine.base[fx.base + offset] = value
+        self._labels.add(label)
 
     def _apply_cc(self, cc: int, value: int) -> None:
         # called synchronously from MidiCC.poll(); reads bindings dynamically so
@@ -541,10 +771,32 @@ class Interpreter:
     def _cc_listener(self, cc: int) -> Callable[[int], None]:
         return lambda value: self._apply_cc(cc, value)
 
+    @staticmethod
+    def _compact_refs(refs: list[tuple[str, int]]) -> str:
+        # collapse consecutive same-label numbers into `wash 1 thru 6`
+        parts: list[str] = []
+        i = 0
+        while i < len(refs):
+            label, n = refs[i]
+            j = i
+            while j + 1 < len(refs) and refs[j + 1] == (label, refs[j][1] + 1):
+                j += 1
+            if j > i:
+                parts.append(f"{label} {n} thru {refs[j][1]}")
+            else:
+                parts.append(f"{label} {n}")
+            i = j + 1
+        return " ".join(parts)
+
     def serialise(self) -> list[str]:
         """Render the persistent show state as replayable console commands."""
         lines = ["# aioartnet console show file"]
-        # submasters first, so later `sub N at`/`midi bind` lines resolve
+        # fixtures and groups first, so later selectors resolve
+        for fx in self.fixtures.values():
+            lines.append(f"patch {fx.kind} {fx.label} {fx.number} @ {fx.base + 1}")
+        for name, refs in self.groups.items():
+            lines.append(f"group {name} = {self._compact_refs(refs)}")
+        # submasters next, so later `sub N at`/`midi bind` lines resolve
         for i, sub in enumerate(self.engine.subs):
             for ci in sub.channels:
                 lines.append(f"chan {ci.channel + 1} at 0x{ci.intensity:02X}")
@@ -600,6 +852,28 @@ class Interpreter:
             case ["midi", "bind", "cc", ccnum]:
                 # target omitted -> unbind (listener stays but no-ops)
                 self.bindings.pop(int(ccnum), None)
+            case ["patch", profile, label, *rest]:
+                self._patch(profile, label, rest)
+            case ["group", name, *sel]:
+                if sel and sel[0] == "=":
+                    sel = sel[1:]
+                fixtures, remainder = self._take_selector(sel)
+                if remainder:
+                    raise ValueError(f"unknown fixtures in group: {remainder}")
+                self.groups[name] = [(fx.label, fx.number) for fx in fixtures]
+            case ["fix" | "fixture"]:
+                if self.fixtures:
+                    for fx in self.fixtures.values():
+                        print(f"{fx.label} {fx.number} ({fx.kind}) @ {fx.base + 1}")
+                else:
+                    print("No fixtures patched")
+            case ["fix" | "fixture", *rest]:
+                fixtures, attrs = self._take_selector(rest)
+                if not fixtures:
+                    raise ValueError("no fixtures selected")
+                if not attrs:
+                    raise ValueError("nothing to set")
+                self._apply_fix(fixtures, attrs)
             case ["record", ("cue" | "sub") as target, cue_num, *args]:
                 # record cue 1 time 3
                 fade_in = 0
@@ -676,6 +950,13 @@ class Interpreter:
                         print(f"sub {idx + 1:03} {sub}")
                 else:
                     print("No submasters")
+                for fx in self.fixtures.values():
+                    print(
+                        f"fixture {fx.label} {fx.number} "
+                        f"({fx.kind}) @ {fx.base + 1}"
+                    )
+                for name, refs in self.groups.items():
+                    print(f"group {name} = {self._compact_refs(refs)}")
                 for cc, idx in sorted(self.bindings.items()):
                     print(f"bind cc {cc} -> sub {idx + 1}")
             case ["save"] | ["save", _]:
@@ -801,7 +1082,8 @@ async def main(
             Window(height=1, char="─", style="class:sep"),
             Window(
                 content=BufferControl(buffer=log_buffer, focusable=False),
-                wrap_lines=False,
+                # wrap long echoes instead of scrolling the pane horizontally
+                wrap_lines=True,
             ),
             Window(height=1, char="─", style="class:sep"),
             VSplit(
@@ -893,8 +1175,9 @@ if __name__ == "__main__":
 
     config = load_config()
     midi = setup_midi_from_config(config, args.midi_in)
+    profiles = load_profiles(config)
 
-    interpreter = Interpreter(engine, midi=midi)
+    interpreter = Interpreter(engine, midi=midi, profiles=profiles)
     interpreter.showfile_path = args.file  # may be None
 
     asyncio.run(
