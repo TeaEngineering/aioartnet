@@ -28,6 +28,13 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+# interactive lighting console (aioartnet/console.py)
+console = [
+    "prompt_toolkit",
+    "python-rtmidi",
+]
+
 [project.urls]
 Homepage = "https://github.com/TeaEngineering/aioartnet"
 Issues = "https://github.com/TeaEngineering/aioartnet/issues"
