@@ -230,6 +230,41 @@ async def test_midi_rebind_does_not_stack_listeners() -> None:
 
 
 @pytest.mark.asyncio
+async def test_midi_note_flashes_submaster() -> None:
+    from aioartnet.console import NOTE_OFF, NOTE_ON, MidiCC
+
+    engine = Engine(Mock(), universe_size=20)
+    fake = _FakeMidiIn()
+    midi = MidiCC(fake)
+    it = Interpreter(engine, midi=midi)
+
+    await it.on_cmd("chan 1 at f")
+    await it.on_cmd("record sub 1")  # sub 1 fader starts at 0.0
+    await it.on_cmd("midi bind note 36 flash sub 1")
+    assert it.note_bindings == {36: ("flash", 0)}
+
+    # press -> full while held
+    fake.feed([NOTE_ON, 36, 100])
+    midi.poll()
+    assert engine.subs[0].intensity == 1.0
+
+    # a repeated note-on (retrigger) must not corrupt the saved value
+    fake.feed([NOTE_ON, 36, 110])
+    midi.poll()
+    assert engine.subs[0].intensity == 1.0
+
+    # release -> restored to the pre-flash fader value
+    fake.feed([NOTE_OFF, 36, 0])
+    midi.poll()
+    assert engine.subs[0].intensity == 0.0
+
+    # round-trips through the show file, and unbinds
+    assert "midi bind note 36 flash sub 1" in it.serialise()
+    await it.on_cmd("midi bind note 36")
+    assert it.note_bindings == {}
+
+
+@pytest.mark.asyncio
 async def test_midi_unbind() -> None:
     from aioartnet.console import CONTROLLER_CHANGE, MidiCC
 

@@ -248,6 +248,14 @@ class MidiCC:
         self.cc_last: dict[int, int] = dict(cc_defaults) if cc_defaults else {}
         self.cc_pending: dict[int, int] = {}
         self.cc_listeners: dict[int, list[Callable[[int], None]]] = defaultdict(list)
+        # note listeners get True on press, False on release
+        self.note_listeners: dict[int, list[Callable[[bool], None]]] = defaultdict(
+            list
+        )
+
+    def _fire_note(self, note: int, pressed: bool) -> None:
+        for listener in self.note_listeners.get(note, []):
+            listener(pressed)
 
     def poll(self) -> None:
         # drain every queued message (get_message() returns None when empty)
@@ -261,13 +269,18 @@ class MidiCC:
                 self.cc_last[message[1]] = message[2]
                 self.cc_pending[message[1]] = message[2]
             elif status == NOTE_ON:
-                # note-on with velocity 0 is conventionally a note-off
-                if message[2] == 0:
-                    self.notes_on.pop(message[1], None)
+                note, vel = message[1], message[2]
+                if vel == 0:  # note-on velocity 0 is conventionally a note-off
+                    if self.notes_on.pop(note, None) is not None:
+                        self._fire_note(note, False)
+                elif note not in self.notes_on:  # only fire on the press edge
+                    self.notes_on[note] = vel
+                    self._fire_note(note, True)
                 else:
-                    self.notes_on[message[1]] = message[2]
+                    self.notes_on[note] = vel
             elif status == NOTE_OFF:
-                self.notes_on.pop(message[1], None)
+                if self.notes_on.pop(message[1], None) is not None:
+                    self._fire_note(message[1], False)
             elif status == POLY_AFTERTOUCH:
                 self.notes_on[message[1]] = message[2]
             # CHANNEL_AFTERTOUCH / PROGRAM_CHANGE / clock / etc. are ignored
@@ -281,6 +294,9 @@ class MidiCC:
     def bind_cc(self, channel: int, listener: Callable[[int], None]) -> None:
         self.cc_listeners[channel].append(listener)
         self.cc_last.setdefault(channel, 0)
+
+    def bind_note(self, note: int, listener: Callable[[bool], None]) -> None:
+        self.note_listeners[note].append(listener)
 
     async def run(self, interval: float = 0.01) -> None:
         while True:
@@ -602,6 +618,8 @@ Available commands:
             [fade_in D] [fade_out D] [hold D]
   midi bind cc C sub N              bind MIDI CC C to submaster N
   midi bind cc C                    unbind MIDI CC C
+  midi bind note K flash sub N      pad K flashes submaster N while held
+  midi bind note K                  unbind pad K
   patch PROFILE LBL N [thru M] @ A  patch fixture(s) of PROFILE at address A
   group NAME = SELECTOR             name a group of fixtures
   fix                               list patched fixtures
@@ -637,6 +655,11 @@ class Interpreter:
         self.bindings: dict[int, int] = {}
         # cc's that already have a live listener attached (avoid stacking)
         self._wired_cc: set[int] = set()
+        # note -> ("flash", sub index); pad bindings (momentary)
+        self.note_bindings: dict[int, tuple[str, int]] = {}
+        self._wired_notes: set[int] = set()
+        # intensity saved while a flash is held, restored on release
+        self._flash_saved: dict[int, float] = {}
         # path of the show file (from --file); target for a bare `save`
         self.showfile_path: Optional[str] = None
         # fixture profiles (from config), patched instances, and groups
@@ -771,6 +794,24 @@ class Interpreter:
     def _cc_listener(self, cc: int) -> Callable[[int], None]:
         return lambda value: self._apply_cc(cc, value)
 
+    def _note_event(self, note: int, pressed: bool) -> None:
+        # called from MidiCC.poll(); reads note_bindings dynamically so
+        # re/unbinding takes effect without re-registering listeners
+        action = self.note_bindings.get(note)
+        if action is None or action[0] != "flash":
+            return
+        idx = action[1]
+        if not (0 <= idx < len(self.engine.subs)):
+            return
+        if pressed:
+            self._flash_saved[note] = self.engine.subs[idx].intensity
+            self.engine.subs[idx].intensity = 1.0
+        elif note in self._flash_saved:
+            self.engine.subs[idx].intensity = self._flash_saved.pop(note)
+
+    def _note_listener(self, note: int) -> Callable[[bool], None]:
+        return lambda pressed: self._note_event(note, pressed)
+
     @staticmethod
     def _compact_refs(refs: list[tuple[str, int]]) -> str:
         # collapse consecutive same-label numbers into `wash 1 thru 6`
@@ -812,6 +853,8 @@ class Interpreter:
             )
         for cc, idx in sorted(self.bindings.items()):
             lines.append(f"midi bind cc {cc} sub {idx + 1}")
+        for note, (action, idx) in sorted(self.note_bindings.items()):
+            lines.append(f"midi bind note {note} {action} sub {idx + 1}")
         return lines
 
     async def on_cmd(self, cmd: str) -> str:
@@ -852,6 +895,16 @@ class Interpreter:
             case ["midi", "bind", "cc", ccnum]:
                 # target omitted -> unbind (listener stays but no-ops)
                 self.bindings.pop(int(ccnum), None)
+            case ["midi", "bind", "note", notenum, "flash", "sub", subnum]:
+                note = int(notenum)
+                idx = parse_user_index(subnum, self.engine.subs, extend=False)
+                self.note_bindings[note] = ("flash", idx)
+                if self.midi is not None and note not in self._wired_notes:
+                    self.midi.bind_note(note, self._note_listener(note))
+                    self._wired_notes.add(note)
+            case ["midi", "bind", "note", notenum]:
+                # action omitted -> unbind (listener stays but no-ops)
+                self.note_bindings.pop(int(notenum), None)
             case ["patch", profile, label, *rest]:
                 self._patch(profile, label, rest)
             case ["group", name, *sel]:
@@ -959,6 +1012,8 @@ class Interpreter:
                     print(f"group {name} = {self._compact_refs(refs)}")
                 for cc, idx in sorted(self.bindings.items()):
                     print(f"bind cc {cc} -> sub {idx + 1}")
+                for note, (action, idx) in sorted(self.note_bindings.items()):
+                    print(f"bind note {note} -> {action} sub {idx + 1}")
             case ["save"] | ["save", _]:
                 # match lowercased the line, so recover the path from the
                 # original cmd to keep case-sensitive paths intact
