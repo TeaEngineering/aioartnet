@@ -498,25 +498,69 @@ Available commands:
   sub|submaster N at|@ LEVEL        set submaster N to LEVEL
   record cue|sub N [fade D]         record current edits as cue/sub N
             [fade_in D] [fade_out D] [hold D]
+  midi bind cc C sub N              bind MIDI CC C to submaster N
+  midi bind cc C                    unbind MIDI CC C
   edits|edit|dirty                  show the current uncommitted edits
   go                                advance to the next cue
   back                              return to the previous cue
   go N                              jump to cue N
   clear                             clear the current edits
-  list                              list all cues and submasters
+  list                              list all cues, submasters and bindings
+  save [path]                       save the show to path (or the --file)
   tickhz N                          set the engine tick rate (Hz)
   view hex|pct                      switch the DMX grid value format
-  help|h|?                          show this help
-
-LEVEL may be a percentage (0-100), a hex value (0xFF), or
-F/FULL, H/HALF, Z/ZERO."""
+LEVEL may be a percentage (0-100), a hex value (0xFF), or F/FULL, H/HALF, Z/ZERO."""
 
 
 # interprets simple commands and formats the responses
 class Interpreter:
-    def __init__(self, engine: Engine, grid: Optional[DmxGrid] = None):
+    def __init__(
+        self,
+        engine: Engine,
+        grid: Optional[DmxGrid] = None,
+        midi: Optional[MidiCC] = None,
+    ):
         self.engine = engine
         self.grid = grid
+        self.midi = midi
+        # cc -> 0-based submaster index; the show state for MIDI bindings
+        self.bindings: dict[int, int] = {}
+        # cc's that already have a live listener attached (avoid stacking)
+        self._wired_cc: set[int] = set()
+        # path of the show file (from --file); target for a bare `save`
+        self.showfile_path: Optional[str] = None
+
+    def _apply_cc(self, cc: int, value: int) -> None:
+        # called synchronously from MidiCC.poll(); reads bindings dynamically so
+        # rebinding/unbinding a cc takes effect without re-registering listeners
+        idx = self.bindings.get(cc)
+        if idx is None or not (0 <= idx < len(self.engine.subs)):
+            return
+        self.engine.subs[idx].intensity = value / 127.0
+
+    def _cc_listener(self, cc: int) -> Callable[[int], None]:
+        return lambda value: self._apply_cc(cc, value)
+
+    def serialise(self) -> list[str]:
+        """Render the persistent show state as replayable console commands."""
+        lines = ["# aioartnet console show file"]
+        # submasters first, so later `sub N at`/`midi bind` lines resolve
+        for i, sub in enumerate(self.engine.subs):
+            for ci in sub.channels:
+                lines.append(f"chan {ci.channel + 1} at 0x{ci.intensity:02X}")
+            lines.append(f"record sub {i + 1}")
+            if sub.intensity > 0:
+                lines.append(f"sub {i + 1} at 0x{round(sub.intensity * 255):02X}")
+        for i, cue in enumerate(self.engine.cues):
+            for ci in cue.channels:
+                lines.append(f"chan {ci.channel + 1} at 0x{ci.intensity:02X}")
+            lines.append(
+                f"record cue {i + 1} fade_in {int(cue.fade_in)} "
+                f"fade_out {int(cue.fade_out)} hold {int(cue.hold)}"
+            )
+        for cc, idx in sorted(self.bindings.items()):
+            lines.append(f"midi bind cc {cc} sub {idx + 1}")
+        return lines
 
     async def on_cmd(self, cmd: str) -> str:
         match cmd.lower().split():
@@ -540,6 +584,22 @@ class Interpreter:
                 cn = parse_user_index(chan, self.engine.subs, extend=False)
                 # submaster intensity is a 0.0-1.0 fader scaling recorded levels
                 self.engine.subs[cn].intensity = intensity / 255.0
+            case ["midi", "bind", "cc", ccnum, "sub", subnum]:
+                cc = int(ccnum)
+                idx = parse_user_index(subnum, self.engine.subs, extend=False)
+                self.bindings[cc] = idx  # always recorded so `save` can emit it
+                if self.midi is not None:
+                    if cc not in self._wired_cc:
+                        # one listener per cc; it dispatches through _apply_cc,
+                        # which reads self.bindings dynamically
+                        self.midi.bind_cc(cc, self._cc_listener(cc))
+                        self._wired_cc.add(cc)
+                    # snap the fader to the knob's current position
+                    if cc in self.midi.cc_last:
+                        self._apply_cc(cc, self.midi.cc_last[cc])
+            case ["midi", "bind", "cc", ccnum]:
+                # target omitted -> unbind (listener stays but no-ops)
+                self.bindings.pop(int(ccnum), None)
             case ["record", ("cue" | "sub") as target, cue_num, *args]:
                 # record cue 1 time 3
                 fade_in = 0
@@ -616,6 +676,22 @@ class Interpreter:
                         print(f"sub {idx + 1:03} {sub}")
                 else:
                     print("No submasters")
+                for cc, idx in sorted(self.bindings.items()):
+                    print(f"bind cc {cc} -> sub {idx + 1}")
+            case ["save"] | ["save", _]:
+                # match lowercased the line, so recover the path from the
+                # original cmd to keep case-sensitive paths intact
+                parts = cmd.split()
+                path = parts[1] if len(parts) > 1 else self.showfile_path
+                if not path:
+                    raise ValueError(
+                        "no show file: use 'save <path>' or start with --file"
+                    )
+                with open(os.path.expanduser(path), "w") as f:
+                    f.write("\n".join(self.serialise()) + "\n")
+                if len(parts) > 1:
+                    self.showfile_path = path
+                print(f"saved to {path}")
             case ["tickhz", hz]:
                 self.engine.tickhz = int(hz)
             case ["view", ("hex" | "pct" | "percent" | "fl") as fmt]:
@@ -631,9 +707,15 @@ class Interpreter:
         return ""
 
     async def load_commands(self, filename: str) -> None:
-        with open(filename, "r") as file:
-            for line in file.read():
-                await self.on_cmd(line.strip())
+        with open(os.path.expanduser(filename)) as file:
+            for lineno, raw in enumerate(file, 1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    await self.on_cmd(line)
+                except Exception:
+                    print(f"{filename}:{lineno}: {traceback.format_exc(limit=-2)}")
 
 
 class _LogWriter:
@@ -762,6 +844,8 @@ async def main(
     if midi is not None:
         tasks.append(asyncio.create_task(midi.run()))
     try:
+        if interpreter.showfile_path:
+            await interpreter.load_commands(interpreter.showfile_path)
         await app.run_async()
     finally:
         for t in tasks:
@@ -806,14 +890,12 @@ if __name__ == "__main__":
 
     # setup console engine/interpreter wired to our universe
     engine = Engine(u1.set_dmx)
-    interpreter = Interpreter(engine)
 
     config = load_config()
     midi = setup_midi_from_config(config, args.midi_in)
 
-    # TODO: needs await as cmds are async?
-    # if args.file:
-    #    interpreter.load_commands(args.file)
+    interpreter = Interpreter(engine, midi=midi)
+    interpreter.showfile_path = args.file  # may be None
 
     asyncio.run(
         main(client, engine, interpreter, u1.get_dmx, args.universe, midi=midi)
