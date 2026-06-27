@@ -855,6 +855,158 @@ async def test_fixture_inspect_vs_group_summary(capsys) -> None:  # type: ignore
     assert "settable attributes" in out and "abs" not in out
 
 
+@pytest.mark.asyncio
+async def test_look_bank_no_htp_bleed() -> None:
+    from aioartnet.console import SRC_LOOK
+
+    engine = Engine(Mock(), universe_size=60)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    # star_wash_bl: red@3 green@4 blue@5 gobo@7
+    await it.on_cmd("patch star_wash_bl head 1 @ 1")
+    await it.on_cmd("group heads = head 1")
+    await it.on_cmd("bank heads red_moon = fix heads gobo moon ; fix heads color red")
+    await it.on_cmd("bank heads grn_star = fix heads gobo stars ; fix heads color green")
+
+    await it.on_cmd("bank heads red_moon")
+    await engine.poll(0.0)
+    live = _captured(engine)
+    assert live[7] == 100  # gobo moon
+    assert (live[3], live[4], live[5]) == (255, 0, 0)
+    assert engine.last_source[7] == SRC_LOOK
+
+    # switching fully replaces: gobo=stars (NOT max), red cleared to 0
+    await it.on_cmd("bank heads grn_star")
+    await engine.poll(0.0)
+    live = _captured(engine)
+    assert live[7] == 50  # stars, not max(100, 50)
+    assert (live[3], live[4], live[5]) == (0, 255, 0)
+    assert it.banks["heads"].active == "grn_star"
+    assert list(engine.looks.keys()) == ["heads"]  # one entry: mutex
+
+    # deactivate clears the bank
+    await it.on_cmd("bank heads off")
+    await engine.poll(0.0)
+    assert "heads" not in engine.looks
+    assert engine.last_source[7] != SRC_LOOK
+
+
+@pytest.mark.asyncio
+async def test_look_bank_note_activation_and_layering() -> None:
+    from aioartnet.console import NOTE_ON, SRC_LIVE, MidiCC
+
+    engine = Engine(Mock(), universe_size=60)
+    fake = _FakeMidiIn()
+    midi = MidiCC(fake)
+    it = Interpreter(engine, midi=midi, profiles=_fixture_profiles())
+    await it.on_cmd("patch star_wash_bl head 1 @ 1")
+    await it.on_cmd("group heads = head 1")
+    await it.on_cmd("bank heads a = fix heads gobo moon")
+    await it.on_cmd("bank heads b = fix heads gobo stars")
+    await it.on_cmd("midi bind note 9:40 bank heads a")
+    await it.on_cmd("midi bind note 9:41 bank heads b")
+
+    # note activation is synchronous (no await needed in the dispatch path)
+    fake.feed([NOTE_ON | 9, 41, 100])
+    midi.poll()
+    assert it.banks["heads"].active == "b"
+    fake.feed([NOTE_ON | 9, 40, 100])
+    midi.poll()
+    assert it.banks["heads"].active == "a"
+    # re-press stays active (radio, no toggle-off)
+    fake.feed([NOTE_ON | 9, 40, 100])
+    midi.poll()
+    assert it.banks["heads"].active == "a"
+
+    # a manual live edit still punches over the look (SRC_LIVE on top)
+    await it.on_cmd("live on")
+    await it.on_cmd("fix heads gobo open")  # gobo@7 -> 0
+    await engine.poll(0.0)
+    assert _captured(engine)[7] == 0
+    assert engine.last_source[7] == SRC_LIVE
+
+
+@pytest.mark.asyncio
+async def test_look_bank_validation() -> None:
+    engine = Engine(Mock(), universe_size=60)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    await it.on_cmd("patch star_wash_bl head 1 @ 1")
+    await it.on_cmd("group heads = head 1")
+
+    with pytest.raises(ValueError):
+        await it.on_cmd("bank heads bad = record cue 1")  # not a fix/chan command
+    with pytest.raises(ValueError):
+        await it.on_cmd("bank heads empty = ")  # empty body
+    with pytest.raises(ValueError):
+        await it.on_cmd("bank heads off = fix heads gobo open")  # 'off' reserved
+    assert "heads" not in it.banks  # nothing stored on failure
+
+    # 'bank B off' still deactivates cleanly
+    await it.on_cmd("bank heads a = fix heads gobo moon")
+    await it.on_cmd("bank heads a")
+    await it.on_cmd("bank heads off")
+    assert it.banks["heads"].active is None
+
+
+@pytest.mark.asyncio
+async def test_look_bank_recompiles_on_repatch() -> None:
+    engine = Engine(Mock(), universe_size=120)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    await it.on_cmd("patch star_wash_bl head 1 @ 1")  # base 0, gobo@7
+    await it.on_cmd("group heads = head 1")
+    await it.on_cmd("bank heads a = fix heads gobo moon")
+    await it.on_cmd("bank heads a")
+    assert {ci.channel for ci in it.banks["heads"].looks["a"].compiled} == {7}
+
+    await it.on_cmd("patch star_wash_bl head 1 @ 40")  # re-patch to base 39
+    assert {ci.channel for ci in it.banks["heads"].looks["a"].compiled} == {46}
+    await engine.poll(0.0)
+    assert _captured(engine)[46] == 100  # output tracks the new patch
+
+
+@pytest.mark.asyncio
+async def test_look_bank_round_trip() -> None:
+    profiles = _fixture_profiles()
+    src = Interpreter(Engine(Mock(), universe_size=60), profiles=profiles)
+    await src.on_cmd("patch star_wash_bl head 1 @ 1")
+    await src.on_cmd("group heads = head 1")
+    await src.on_cmd("bank heads a = fix heads gobo moon ; fix heads color red")
+    await src.on_cmd("bank heads b = fix heads gobo stars ; fix heads color green")
+    await src.on_cmd("bank heads b")  # active
+    await src.on_cmd("midi bind note 9:40 bank heads a")
+
+    dst = Interpreter(Engine(Mock(), universe_size=60), profiles=profiles)
+    for line in src.serialise():
+        if not line.startswith("#"):
+            await dst.on_cmd(line)
+
+    assert dst.banks["heads"].active == "b"
+    assert (
+        dst.banks["heads"].looks["a"].commands
+        == src.banks["heads"].looks["a"].commands
+    )
+    assert dst.note_bindings == src.note_bindings
+
+
+@pytest.mark.asyncio
+async def test_looks_view_render() -> None:
+    from aioartnet.console import LooksView
+
+    it = Interpreter(Engine(Mock(), universe_size=60), profiles=_fixture_profiles())
+    assert "no banks" in "".join(t for _, t in LooksView(it).render())
+
+    await it.on_cmd("patch star_wash_bl head 1 @ 1")
+    await it.on_cmd("group heads = head 1")
+    await it.on_cmd("bank heads a = fix heads gobo moon")
+    await it.on_cmd("bank heads b = fix heads gobo stars")
+    await it.on_cmd("bank heads b")
+
+    frags = LooksView(it).render()
+    text = "".join(t for _, t in frags)
+    assert "a" in text and "b" in text
+    active = [s for s, t in frags if t.strip() == "b"]
+    assert any("bold" in s for s in active)  # active look highlighted
+
+
 def test_midi_missing_device_not_required(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import aioartnet.console as console
 

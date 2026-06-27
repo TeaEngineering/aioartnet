@@ -44,6 +44,24 @@ class ChannelIntensity:
 
 
 @dataclass
+class Look:
+    """A named look: high-level commands plus their compiled channel values."""
+
+    name: str
+    commands: list[str]  # verbatim, for persistence/display
+    compiled: list[ChannelIntensity] = field(default_factory=list)
+
+
+@dataclass
+class Bank:
+    """A mutually-exclusive group of looks (at most one active at a time)."""
+
+    name: str
+    looks: dict[str, Look] = field(default_factory=dict)
+    active: Optional[str] = None
+
+
+@dataclass
 class Cue:
     name: str
     fade_in: float
@@ -89,6 +107,7 @@ SRC_STORED = 1  # held by an active cue or submaster
 SRC_LIVE = 2  # overridden by a live edit
 SRC_DEFAULT = 3  # held at a fixture profile default (base layer)
 SRC_FX = 4  # driven by an effect unit
+SRC_LOOK = 5  # held by an active look bank
 
 
 def apply_ci(
@@ -291,6 +310,8 @@ class Engine:
         self._active_cues: list[ActiveCue] = []
         # effect units (e.g. "rgb", "pt"), ticked each poll beneath live edits
         self.effects: dict[str, Effect] = {}
+        # active look channels per bank (LTP overwrite, above subs, below fx)
+        self.looks: dict[str, list[ChannelIntensity]] = {}
 
     async def poll(self, time: float) -> None:
         # advance time
@@ -328,6 +349,12 @@ class Engine:
             if sub.intensity > 0:
                 for e in sub.channels:
                     source[e.channel] = SRC_STORED
+
+        # active look banks snap over cues/subs (LTP overwrite, no HTP merge)
+        for channels in self.looks.values():
+            apply_ci(live, channels, scale=1.0, htp=False)
+            for e in channels:
+                source[e.channel] = SRC_LOOK
 
         # effects sit above cues/subs; tick() writes live and stamps SRC_FX
         for eff in self.effects.values():
@@ -726,6 +753,7 @@ class DmxGrid:
         SRC_LIVE: "fg:red",
         SRC_DEFAULT: "fg:#2a6fdb",  # blue: held at a fixture profile default
         SRC_FX: "fg:#d08020",  # amber: driven by an effect unit
+        SRC_LOOK: "fg:#1f9e4a",  # green: held by an active look bank
     }
 
     def __init__(
@@ -879,6 +907,28 @@ class FxView:
         return frags
 
 
+class LooksView:
+    """Renders each look bank as a row of look names, active one highlighted."""
+
+    HEIGHT = 4  # title + a few banks; wrap_lines handles overflow
+
+    def __init__(self, interpreter: "Interpreter") -> None:
+        self.it = interpreter
+
+    def render(self) -> StyleAndTextTuples:
+        frags: StyleAndTextTuples = [("bold", " LOOKS\n")]
+        if not self.it.banks:
+            frags.append(("class:dim", " (no banks configured)"))
+            return frags
+        for name, bank in self.it.banks.items():
+            frags.append(("class:dim", f" {name}: "))
+            for look in bank.looks:
+                style = "fg:#1f9e4a bold" if look == bank.active else "class:dim"
+                frags.append((style, f"{look} "))
+            frags.append(("", "\n"))
+        return frags
+
+
 HELP_TEXT = """\
 Available commands:
   live on|off                       enable/disable live edits in the output
@@ -913,6 +963,11 @@ Available commands:
   fx pt home [PAN TILT]             capture (or set) the group's home positions
   midi bind cc C fx UNIT PARAM      drive an effect param from a CC knob
   midi bind note K fx UNIT PARAM V  pad K sets an effect param (e.g. style)
+  bank                              list look banks
+  bank B [L]                        list a bank (or activate look L, snap)
+  bank B L = fix ... ; fix ...      define a look (fix/chan commands)
+  bank B off                        deactivate bank B
+  midi bind note K bank B L         pad K activates look L in bank B
   edits|edit|dirty                  show the current uncommitted edits
   go                                advance to the next cue
   back                              return to the previous cue
@@ -955,6 +1010,8 @@ class Interpreter:
         self.groups: dict[str, list[tuple[str, int]]] = {}
         # per-fixture pan/tilt home positions for the PT effect
         self.homes: dict[tuple[str, int], tuple[int, int]] = {}
+        # named look banks (mutually-exclusive high-level looks)
+        self.banks: dict[str, Bank] = {}
 
     def _fixture(self, label: str, number: int) -> PatchedFixture:
         try:
@@ -1166,6 +1223,107 @@ class Interpreter:
             if eff.group is not None:
                 eff.lanes = self._resolve_lanes(unit, eff.group)
 
+    # ---- look banks -------------------------------------------------------
+    _LOOK_VERBS = {"fix", "fixture", "chan", "ch"}
+
+    def _validate_look_commands(self, commands: list[str]) -> None:
+        for c in commands:
+            toks = c.split()
+            if not toks:
+                raise ValueError("empty look command")
+            if toks[0].lower() not in self._LOOK_VERBS:
+                raise ValueError(f"look commands must be fix/chan only: {c!r}")
+
+    async def _compile_look(self, commands: list[str]) -> list[ChannelIntensity]:
+        # run the commands capturing the net edits, without touching output
+        saved_edits, saved_live = self.engine.edits, self.engine.live_edit
+        self.engine.edits, self.engine.live_edit = [], False
+        try:
+            for c in commands:
+                await self.on_cmd(c)
+            return list(self.engine.edits)
+        finally:
+            self.engine.edits, self.engine.live_edit = saved_edits, saved_live
+
+    async def _define_look(self, bank: str, name: str, commands: list[str]) -> None:
+        if name == "off":
+            raise ValueError("'off' is reserved (use 'bank B off' to clear)")
+        commands = [c.strip() for c in commands if c.strip()]
+        if not commands:
+            raise ValueError("a look needs at least one command")
+        self._validate_look_commands(commands)
+        compiled = await self._compile_look(commands)  # may raise -> not stored
+        b = self.banks.setdefault(bank, Bank(name=bank))
+        b.looks[name] = Look(name=name, commands=commands, compiled=compiled)
+        if b.active == name:  # refresh output if redefining the live look
+            self.engine.looks[bank] = compiled
+
+    def _activate_look(self, bank: str, name: str) -> None:
+        b = self.banks.get(bank)
+        if b is None or name not in b.looks:
+            raise ValueError(f"no look {name!r} in bank {bank!r}")
+        b.active = name  # mutex: one active look per bank
+        self.engine.looks[bank] = b.looks[name].compiled
+
+    def _deactivate_bank(self, bank: str) -> None:
+        b = self.banks.get(bank)
+        if b is None:
+            raise ValueError(f"no bank {bank!r}")
+        b.active = None
+        self.engine.looks.pop(bank, None)
+
+    async def _rebind_banks(self) -> None:
+        # fixtures/groups changed: recompile every look's commands to channels
+        for bank, b in self.banks.items():
+            for look in b.looks.values():
+                try:
+                    look.compiled = await self._compile_look(look.commands)
+                except Exception:
+                    look.compiled = []  # broken after re-patch -> contributes nothing
+            if b.active is not None and b.active in b.looks:
+                self.engine.looks[bank] = b.looks[b.active].compiled
+
+    def _list_banks(self) -> None:
+        if not self.banks:
+            print("No banks")
+            return
+        for name, b in self.banks.items():
+            self._print_bank(name, b)
+
+    def _list_bank(self, bank: str) -> None:
+        b = self.banks.get(bank)
+        if b is None:
+            raise ValueError(f"no bank {bank!r}")
+        self._print_bank(bank, b)
+
+    @staticmethod
+    def _print_bank(name: str, b: Bank) -> None:
+        print(f"bank {name} (active: {b.active or '-'})")
+        for look_name, look in b.looks.items():
+            mark = "*" if look_name == b.active else " "
+            print(f"  {mark} {look_name}: {' ; '.join(look.commands)}")
+
+    async def _bank_cmd(self, cmd: str) -> None:
+        # parse the original-case line (match lowercased it); names are
+        # lowercased identifiers, command bodies kept verbatim
+        parts = cmd.split()
+        bank = parts[1].lower()
+        rest = parts[2:]
+        if not rest:  # bank B -> list
+            self._list_bank(bank)
+        elif "=" in rest:  # bank B L = c1 ; c2 ...
+            eq = rest.index("=")
+            if eq != 1:
+                raise ValueError("usage: bank B L = <cmd> ; <cmd> ...")
+            body = " ".join(rest[2:])
+            await self._define_look(bank, rest[0].lower(), body.split(";"))
+        elif len(rest) == 1 and rest[0].lower() == "off":  # bank B off
+            self._deactivate_bank(bank)
+        elif len(rest) == 1:  # bank B L -> activate
+            self._activate_look(bank, rest[0].lower())
+        else:
+            raise ValueError(f"unknown bank command: {cmd!r}")
+
     def _set_fx_param(self, unit: str, param: str, value: str) -> None:
         eff = self._ensure_effect(unit)
         spec = EFFECT_PARAMS[unit].get(param)
@@ -1244,11 +1402,12 @@ class Interpreter:
             )
             print(f"bind cc {fmt_chan_num(key)} -> {dst}")
         for key, tgt in sorted(self.note_bindings.items(), key=lambda kv: kv[0]):
-            dst = (
-                f"flash sub {tgt[1] + 1}"
-                if tgt[0] == "flash"
-                else f"fx {tgt[1]} {tgt[2]} {tgt[3]}"
-            )
+            if tgt[0] == "flash":
+                dst = f"flash sub {tgt[1] + 1}"
+            elif tgt[0] == "bank":
+                dst = f"bank {tgt[1]} {tgt[2]}"
+            else:
+                dst = f"fx {tgt[1]} {tgt[2]} {tgt[3]}"
             print(f"bind note {fmt_chan_num(key)} -> {dst}")
 
     def _patch(self, profile: str, label: str, rest: list[str]) -> None:
@@ -1344,6 +1503,12 @@ class Interpreter:
                 self._set_fx_param(unit, param, value)
             except (ValueError, KeyError):
                 pass
+        elif tgt[0] == "bank" and pressed:
+            # radio: activate the look (replaces the bank's previous look)
+            _, bank, name = tgt
+            b = self.banks.get(bank)
+            if b is not None and name in b.looks:
+                self._activate_look(bank, name)
 
     def _note_listener(self, key: MidiKey) -> Callable[[bool], None]:
         return lambda pressed: self._note_event(key, pressed)
@@ -1382,6 +1547,12 @@ class Interpreter:
                     lines.append(f"fx {unit} {p} {self._fmt_param(unit, p, v)}")
         for (label, number), (pan, tilt) in self.homes.items():
             lines.append(f"fx pt home {label} {number} {pan} {tilt}")
+        # look banks after groups (selectors resolve); definitions then active
+        for bank, b in self.banks.items():
+            for name, look in b.looks.items():
+                lines.append(f"bank {bank} {name} = {' ; '.join(look.commands)}")
+            if b.active is not None:
+                lines.append(f"bank {bank} {b.active}")
         # submasters next, so later `sub N at`/`midi bind` lines resolve
         for i, sub in enumerate(self.engine.subs):
             for ci in sub.channels:
@@ -1406,6 +1577,8 @@ class Interpreter:
             note = fmt_chan_num(key)
             if tgt[0] == "flash":
                 lines.append(f"midi bind note {note} flash sub {tgt[1] + 1}")
+            elif tgt[0] == "bank":
+                lines.append(f"midi bind note {note} bank {tgt[1]} {tgt[2]}")
             else:
                 lines.append(
                     f"midi bind note {note} fx {tgt[1]} {tgt[2]} {tgt[3]}"
@@ -1462,11 +1635,19 @@ class Interpreter:
                 self._validate_fx_param(unit, param)
                 self.note_bindings[key] = ("fx", unit, param, value)
                 self._wire_note(key)
+            case ["midi", "bind", "note", notenum, "bank", bank, look]:
+                key = parse_chan_num(notenum)
+                b = self.banks.get(bank)
+                if b is None or look not in b.looks:
+                    raise ValueError(f"no look {look!r} in bank {bank!r}")
+                self.note_bindings[key] = ("bank", bank, look)
+                self._wire_note(key)
             case ["midi", "bind", "note", notenum]:
                 # action omitted -> unbind (listener stays but no-ops)
                 self.note_bindings.pop(parse_chan_num(notenum), None)
             case ["patch", profile, label, *rest]:
                 self._patch(profile, label, rest)
+                await self._rebind_banks()  # looks may reference new fixtures
             case ["group"]:
                 self._list_groups()
             case ["group", name, *sel]:
@@ -1477,6 +1658,11 @@ class Interpreter:
                     raise ValueError(f"unknown fixtures in group: {remainder}")
                 self.groups[name] = [(fx.label, fx.number) for fx in fixtures]
                 self._rebind_effects()  # group membership may have changed
+                await self._rebind_banks()  # look selectors may have changed
+            case ["bank"]:
+                self._list_banks()
+            case ["bank", _bankname, *_rest]:
+                await self._bank_cmd(cmd)
             case ["fix" | "fixture"]:
                 if self.fixtures:
                     for fx in self.fixtures.values():
@@ -1593,6 +1779,8 @@ class Interpreter:
                     )
                 self._list_groups()
                 self._list_effects()
+                if self.banks:
+                    self._list_banks()
                 self._list_bindings()
             case ["save"] | ["save", _]:
                 # match lowercased the line, so recover the path from the
@@ -1666,6 +1854,7 @@ async def main(
     interpreter.grid = grid
     midi_view = MidiView(midi)
     fx_view = FxView(engine)
+    looks_view = LooksView(interpreter)
 
     history = FileHistory(os.path.expanduser("~/.aioartnet-console-history"))
 
@@ -1726,6 +1915,13 @@ async def main(
                 height=FxView.HEIGHT,
                 wrap_lines=True,
                 style="class:fx",
+            ),
+            Window(height=1, char="─", style="class:sep"),
+            Window(
+                content=FormattedTextControl(looks_view.render),
+                height=LooksView.HEIGHT,
+                wrap_lines=True,
+                style="class:looks",
             ),
             Window(height=1, char="─", style="class:sep"),
             Window(
