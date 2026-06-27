@@ -555,9 +555,8 @@ async def test_fx_pt_home_and_movement() -> None:
     await it.on_cmd("fx pt group heads")
     await it.on_cmd("fx pt home 100 100")
     await it.on_cmd("fx pt mode circle")
-    await it.on_cmd("fx pt size 100")
+    await it.on_cmd("fx pt size 100")  # size is the amplitude AND the gate
     await it.on_cmd("fx pt speed 0")
-    await it.on_cmd("fx pt intensity 100")
 
     await engine.poll(0.0)  # theta 0 -> cos=1,sin=0 -> pan=home+amp, tilt=home
     live = _captured(engine)
@@ -800,7 +799,6 @@ async def test_fx_pt_16bit_fine_channels() -> None:
     await it.on_cmd("fx pt mode circle")
     await it.on_cmd("fx pt size 50")  # amp16 = 0.5*127*256 = 16256
     await it.on_cmd("fx pt speed 0")
-    await it.on_cmd("fx pt intensity 100")
     await engine.poll(0.0)  # theta 0 -> dpan=1, dtilt=0
 
     live = _captured(engine)
@@ -1060,9 +1058,11 @@ async def test_fx_unit_inspection(capsys) -> None:  # type: ignore[no-untyped-de
     capsys.readouterr()  # clear
     await it.on_cmd("fx pt")
     out = capsys.readouterr().out
-    assert "mode      = wave" in out
+    lines = {ln.split("=")[0].strip(): ln for ln in out.splitlines() if "=" in ln}
+    assert lines["mode"].strip().startswith("mode") and "wave" in lines["mode"]
     assert "static|circle|wave|sway" in out
-    assert "size      = 40" in out
+    assert "40" in lines["size"]
+    assert "intensity" not in out  # removed from pt
     assert "head 1 = (100, 120)" in out and "head 2 = (100, 120)" in out
 
     with pytest.raises(ValueError):

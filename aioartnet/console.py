@@ -178,9 +178,8 @@ RGB_PARAMS: dict[str, tuple] = {
     "style": ("enum", "rainbow", tuple(COLOURMAPS)),
 }
 PT_PARAMS: dict[str, tuple] = {
-    "intensity": ("cont", 0.0),
+    "size": ("cont", 0.0),  # swing amplitude AND the on/off gate
     "speed": ("cont", 0.2),
-    "size": ("cont", 0.25),
     "spread": ("cont", 0.3),
     "mode": ("enum", "circle", ("static", "circle", "wave", "sway")),
 }
@@ -202,6 +201,7 @@ class Effect:
 
     unit = ""
     spec: dict[str, tuple] = {}
+    gate = "intensity"  # the param whose value > 0 makes the unit active
 
     def __init__(self) -> None:
         self.group: Optional[str] = None
@@ -211,7 +211,7 @@ class Effect:
         }
 
     def is_active(self) -> bool:
-        return float(self.params["intensity"]) > 0.0
+        return float(self.params[self.gate]) > 0.0
 
     def tick(self, live: bytearray, source: bytearray, t: float) -> None:
         raise NotImplementedError
@@ -244,6 +244,7 @@ class RgbEffect(Effect):
 class PtEffect(Effect):
     unit = "pt"
     spec = PT_PARAMS
+    gate = "size"  # size is the swing amplitude and the on/off gate
 
     _SHAPES = {
         "static": lambda th: (0.0, 0.0),
@@ -260,12 +261,7 @@ class PtEffect(Effect):
         spread = float(self.params["spread"])
         # the home/rest position is an 8-bit coarse value; the movement is
         # computed in 16-bit so it stays smooth and feeds pan_fine/tilt_fine
-        amp16 = (
-            float(self.params["size"])
-            * float(self.params["intensity"])
-            * PT_AMP_MAX
-            * 256
-        )
+        amp16 = float(self.params["size"]) * PT_AMP_MAX * 256
         shape = self._SHAPES[self.params["mode"]]
         for lane in self.lanes:
             theta = 2 * math.pi * (speed * t + (lane.index / n) * spread)
@@ -1001,8 +997,8 @@ Available commands:
   fx rgb|pt group GRP               point an effect at a fixture group
   fx UNIT PARAM VALUE               set effect param (0-100, or style/mode name)
             rgb: intensity speed spread style(rainbow|ocean|fire|abstract)
-            pt:  intensity speed size spread mode(static|circle|wave|sway)
-  fx rgb|pt off                     intensity to 0
+            pt:  size speed spread mode(static|circle|wave|sway)
+  fx rgb|pt off                     turn the unit off (rgb intensity/pt size to 0)
   fx pt home [PAN TILT]             capture (or set) the group's home positions
   midi bind cc C fx UNIT PARAM      drive an effect param from a CC knob
   midi bind note K fx UNIT PARAM V  pad K sets an effect param (e.g. style)
@@ -1807,7 +1803,7 @@ class Interpreter:
                 self._ensure_effect(unit).group = grp
                 self._rebind_effects()
             case ["fx", unit, "off"]:
-                self._set_fx_param(unit, "intensity", "0")
+                self._set_fx_param(unit, self._ensure_effect(unit).gate, "0")
             case ["fx", "pt", "home"]:
                 self._capture_pt_home()
             case ["fx", "pt", "home", pan, tilt]:
