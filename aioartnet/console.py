@@ -1688,6 +1688,10 @@ class Interpreter:
                 lines.append(
                     f"midi bind note {note} fx {tgt[1]} {tgt[2]} {tgt[3]}"
                 )
+        # session state: restore live-edit mode if it was on (emit last, after
+        # the record blocks, so it doesn't apply their transient `chan` edits)
+        if self.engine.live_edit:
+            lines.append("live on")
         # display preference (only when non-default, to keep the file clean)
         if self.grid is not None and (self.grid.trim or self.grid.mode != "hex"):
             lines.append(f"view {self.grid.mode} {'trim' if self.grid.trim else 'all'}")
