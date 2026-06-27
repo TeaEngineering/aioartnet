@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -87,6 +88,7 @@ SRC_UNDRIVEN = 0  # nothing active touches this channel
 SRC_STORED = 1  # held by an active cue or submaster
 SRC_LIVE = 2  # overridden by a live edit
 SRC_DEFAULT = 3  # held at a fixture profile default (base layer)
+SRC_FX = 4  # driven by an effect unit
 
 
 def apply_ci(
@@ -99,6 +101,159 @@ def apply_ci(
         val = max(0, min(255, int(e.intensity * scale)))
         # highest-takes-precedence keeps the brighter of the existing/new level
         data[e.channel] = max(data[e.channel], val) if htp else val
+
+
+# ---- effect engine -------------------------------------------------------
+# colourmaps are defined by control points (QLC+ style); each consecutive pair
+# is expanded to 300 linearly-interpolated samples, so a 2-point map is 300
+# samples and a 4-point map is 900.
+COLOUR_POINTS: dict[str, list[int]] = {
+    "rainbow": [0xFF0000, 0x00FF00, 0x0000FF],
+    "fire": [0xFFFF00, 0xFF0000, 0x000040, 0xFF0000],
+    "abstract": [0x5571FF, 0x00FFFF, 0xFF00FF, 0xFFFF00],
+    "ocean": [0x003AB9, 0x02EAFF],
+}
+_LUT_STEPS = 300
+
+
+def build_lut(points: list[int]) -> list[tuple[int, int, int]]:
+    def rgb(c: int) -> tuple[int, int, int]:
+        return ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
+
+    lut: list[tuple[int, int, int]] = []
+    for a, b in zip(points, points[1:]):
+        ra, ga, ba = rgb(a)
+        rb, gb, bb = rgb(b)
+        for s in range(_LUT_STEPS):
+            f = s / _LUT_STEPS
+            lut.append(
+                (
+                    round(ra + (rb - ra) * f),
+                    round(ga + (gb - ga) * f),
+                    round(ba + (bb - ba) * f),
+                )
+            )
+    return lut
+
+
+COLOURMAPS: dict[str, list[tuple[int, int, int]]] = {
+    name: build_lut(pts) for name, pts in COLOUR_POINTS.items()
+}
+
+# parameter specs: name -> ("cont", default) | ("enum", default, choices)
+# continuous params live as a 0.0-1.0 fraction; explicit values are 0-100 percent
+# and CC values are v/127, so the two are interchangeable.
+RGB_PARAMS: dict[str, tuple] = {
+    "intensity": ("cont", 0.0),
+    "speed": ("cont", 0.2),
+    "spread": ("cont", 0.3),
+    "style": ("enum", "rainbow", tuple(COLOURMAPS)),
+}
+PT_PARAMS: dict[str, tuple] = {
+    "intensity": ("cont", 0.0),
+    "speed": ("cont", 0.2),
+    "size": ("cont", 0.25),
+    "spread": ("cont", 0.3),
+    "mode": ("enum", "circle", ("static", "circle", "wave", "sway")),
+}
+EFFECT_PARAMS: dict[str, dict[str, tuple]] = {"rgb": RGB_PARAMS, "pt": PT_PARAMS}
+
+SPEED_MAX_HZ = 1.0  # animation rate at speed = 100%
+PT_AMP_MAX = 127  # pan/tilt delta in DMX steps at size = 100%
+
+
+@dataclass
+class EffectLane:
+    index: int
+    channels: dict[str, int]  # role ("red"/"pan"/...) -> absolute DMX channel
+    home: tuple[int, int] = (128, 128)  # PT only (pan, tilt)
+
+
+class Effect:
+    """A time-based effect that writes its group's channels each engine tick."""
+
+    unit = ""
+    spec: dict[str, tuple] = {}
+
+    def __init__(self) -> None:
+        self.group: Optional[str] = None
+        self.lanes: list[EffectLane] = []
+        self.params: dict[str, Any] = {
+            name: s[1] for name, s in self.spec.items()
+        }
+
+    def is_active(self) -> bool:
+        return float(self.params["intensity"]) > 0.0
+
+    def tick(self, live: bytearray, source: bytearray, t: float) -> None:
+        raise NotImplementedError
+
+
+class RgbEffect(Effect):
+    unit = "rgb"
+    spec = RGB_PARAMS
+
+    def tick(self, live: bytearray, source: bytearray, t: float) -> None:
+        n = len(self.lanes)
+        if n == 0:
+            return
+        lut = COLOURMAPS[self.params["style"]]
+        total = len(lut)
+        speed = float(self.params["speed"]) * SPEED_MAX_HZ
+        spread = float(self.params["spread"])
+        bri = float(self.params["intensity"])
+        for lane in self.lanes:
+            phase = (speed * t + (lane.index / n) * spread) % 1.0
+            r, g, b = lut[int(phase * total) % total]
+            for role, val in (("red", r), ("green", g), ("blue", b)):
+                ch = lane.channels.get(role)
+                if ch is None:
+                    continue
+                live[ch] = max(0, min(255, round(val * bri)))
+                source[ch] = SRC_FX
+
+
+class PtEffect(Effect):
+    unit = "pt"
+    spec = PT_PARAMS
+
+    _SHAPES = {
+        "static": lambda th: (0.0, 0.0),
+        "circle": lambda th: (math.cos(th), math.sin(th)),
+        "wave": lambda th: (math.sin(th), 0.0),
+        "sway": lambda th: (0.0, math.sin(th)),
+    }
+
+    def tick(self, live: bytearray, source: bytearray, t: float) -> None:
+        n = len(self.lanes)
+        if n == 0:
+            return
+        speed = float(self.params["speed"]) * SPEED_MAX_HZ
+        spread = float(self.params["spread"])
+        amp = float(self.params["size"]) * PT_AMP_MAX * float(self.params["intensity"])
+        shape = self._SHAPES[self.params["mode"]]
+        for lane in self.lanes:
+            theta = 2 * math.pi * (speed * t + (lane.index / n) * spread)
+            dpan, dtilt = shape(theta)
+            for role, home, delta in (
+                ("pan", lane.home[0], dpan),
+                ("tilt", lane.home[1], dtilt),
+            ):
+                ch = lane.channels.get(role)
+                if ch is None:
+                    continue
+                live[ch] = max(0, min(255, home + round(amp * delta)))
+                source[ch] = SRC_FX
+
+
+EFFECT_CLASSES: dict[str, type[Effect]] = {"rgb": RgbEffect, "pt": PtEffect}
+
+
+def format_effect_param(unit: str, param: str, value: Any) -> str:
+    # continuous -> 0-100 percent, enum -> name (inverse of _set_fx_param)
+    if EFFECT_PARAMS[unit][param][0] == "enum":
+        return str(value)
+    return str(round(float(value) * 100))
 
 
 class Engine:
@@ -122,6 +277,8 @@ class Engine:
         self.live_edit = False
         self.tickhz = 10
         self._active_cues: list[ActiveCue] = []
+        # effect units (e.g. "rgb", "pt"), ticked each poll beneath live edits
+        self.effects: dict[str, Effect] = {}
 
     async def poll(self, time: float) -> None:
         # advance time
@@ -147,12 +304,8 @@ class Engine:
             if sub.intensity > 0:
                 apply_ci(live, sub.channels, scale=sub.intensity, htp=True)
 
-        # add live edits
-        if self.live_edit:
-            apply_ci(live, self.edits, 1.0)
-
-        # classify the provenance of each channel, mirroring the mix order
-        # above: base defaults are lowest, then cues/subs "stored", edits "live"
+        # classify provenance so far: base defaults lowest, then cues/subs
+        # "stored". Effects and live edits stamp themselves below.
         source = bytearray(
             SRC_DEFAULT if b else SRC_UNDRIVEN for b in self.base
         )
@@ -163,10 +316,20 @@ class Engine:
             if sub.intensity > 0:
                 for e in sub.channels:
                     source[e.channel] = SRC_STORED
+
+        # effects sit above cues/subs; tick() writes live and stamps SRC_FX
+        for eff in self.effects.values():
+            if eff.is_active():
+                eff.tick(live, source, self.last_poll)
+
+        # live edits punch over everything, including effects
         if self.live_edit:
+            apply_ci(live, self.edits, 1.0)
             for e in self.edits:
                 source[e.channel] = SRC_LIVE
+
         self.last_source = source
+        self.live[:] = live  # keep the last output (used by `fx pt home` capture)
 
         # print(f'calling handler {self.handler} with {self.live}')
         self.handler(live)
@@ -502,6 +665,7 @@ class DmxGrid:
         SRC_STORED: "fg:black",
         SRC_LIVE: "fg:red",
         SRC_DEFAULT: "fg:#2a6fdb",  # blue: held at a fixture profile default
+        SRC_FX: "fg:#d08020",  # amber: driven by an effect unit
     }
 
     def __init__(
@@ -607,6 +771,33 @@ class MidiView:
         return frags
 
 
+class FxView:
+    """Renders the live state of each effect unit: group and current params."""
+
+    HEIGHT = 3  # title + one line per unit (rgb, pt)
+
+    def __init__(self, engine: "Engine") -> None:
+        self.engine = engine
+
+    def render(self) -> StyleAndTextTuples:
+        frags: StyleAndTextTuples = [("bold", " FX\n")]
+        effects = self.engine.effects
+        if not effects:
+            frags.append(("class:dim", " (no effects configured)"))
+            return frags
+        for unit, eff in effects.items():
+            active = eff.is_active()
+            frags.append(("class:dim", f" {unit:<3} "))
+            frags.append(("class:dim", f"group={eff.group} "))
+            frags.append(
+                ("fg:#d08020", "[active] ") if active else ("class:dim", "[off]   ")
+            )
+            for param, value in eff.params.items():
+                frags.append(("", f"{param}={format_effect_param(unit, param, value)} "))
+            frags.append(("", "\n"))
+        return frags
+
+
 HELP_TEXT = """\
 Available commands:
   live on|off                       enable/disable live edits in the output
@@ -627,6 +818,15 @@ Available commands:
   fix SELECTOR color #RRGGBB|NAME   set fixture colour (red/green/blue)
   fix SELECTOR at LEVEL             set fixture dimmer
             SELECTOR = LBL N | LBL N thru M | group name
+  fx                                list effect units
+  fx rgb|pt group GRP               point an effect at a fixture group
+  fx UNIT PARAM VALUE               set effect param (0-100, or style/mode name)
+            rgb: intensity speed spread style(rainbow|ocean|fire|abstract)
+            pt:  intensity speed size spread mode(static|circle|wave|sway)
+  fx rgb|pt off                     intensity to 0
+  fx pt home [PAN TILT]             capture (or set) the group's home positions
+  midi bind cc C fx UNIT PARAM      drive an effect param from a CC knob
+  midi bind note K fx UNIT PARAM V  pad K sets an effect param (e.g. style)
   edits|edit|dirty                  show the current uncommitted edits
   go                                advance to the next cue
   back                              return to the previous cue
@@ -651,12 +851,12 @@ class Interpreter:
         self.engine = engine
         self.grid = grid
         self.midi = midi
-        # cc -> 0-based submaster index; the show state for MIDI bindings
-        self.bindings: dict[int, int] = {}
+        # cc -> binding target: ("sub", idx) or ("fx", unit, param)
+        self.bindings: dict[int, tuple] = {}
         # cc's that already have a live listener attached (avoid stacking)
         self._wired_cc: set[int] = set()
-        # note -> ("flash", sub index); pad bindings (momentary)
-        self.note_bindings: dict[int, tuple[str, int]] = {}
+        # note -> target: ("flash", idx) or ("fx", unit, param, value)
+        self.note_bindings: dict[int, tuple] = {}
         self._wired_notes: set[int] = set()
         # intensity saved while a flash is held, restored on release
         self._flash_saved: dict[int, float] = {}
@@ -667,6 +867,8 @@ class Interpreter:
         self.fixtures: dict[tuple[str, int], PatchedFixture] = {}
         self._labels: set[str] = set()  # patched fixture labels, e.g. {"wash"}
         self.groups: dict[str, list[tuple[str, int]]] = {}
+        # per-fixture pan/tilt home positions for the PT effect
+        self.homes: dict[tuple[str, int], tuple[int, int]] = {}
 
     def _fixture(self, label: str, number: int) -> PatchedFixture:
         try:
@@ -747,6 +949,102 @@ class Interpreter:
                     self._set_attr(fx, attr, tokens[i + 1])
                 i += 2
 
+    # ---- effect units -----------------------------------------------------
+    def _ensure_effect(self, unit: str) -> Effect:
+        if unit not in EFFECT_CLASSES:
+            raise ValueError(f"unknown effect unit {unit!r}")
+        eff = self.engine.effects.get(unit)
+        if eff is None:
+            eff = EFFECT_CLASSES[unit]()
+            self.engine.effects[unit] = eff
+        return eff
+
+    def _default_home(self, fx: PatchedFixture) -> tuple[int, int]:
+        defaults = fx.profile.defaults
+        return (defaults.get("pan", 128), defaults.get("tilt", 128))
+
+    def _resolve_lanes(self, unit: str, group: str) -> list[EffectLane]:
+        roles = ("red", "green", "blue") if unit == "rgb" else ("pan", "tilt")
+        lanes: list[EffectLane] = []
+        for label, number in self.groups.get(group, []):
+            fx = self._fixture(label, number)
+            channels = {
+                role: fx.base + off
+                for role in roles
+                if (off := fx.profile.offset(role)) is not None
+            }
+            if not channels:
+                continue  # this fixture has none of the needed roles
+            home = self.homes.get((label, number)) or self._default_home(fx)
+            lanes.append(EffectLane(len(lanes), channels, home))
+        return lanes
+
+    def _rebind_effects(self) -> None:
+        for unit, eff in self.engine.effects.items():
+            if eff.group is not None:
+                eff.lanes = self._resolve_lanes(unit, eff.group)
+
+    def _set_fx_param(self, unit: str, param: str, value: str) -> None:
+        eff = self._ensure_effect(unit)
+        spec = EFFECT_PARAMS[unit].get(param)
+        if spec is None:
+            raise ValueError(f"{unit}: unknown param {param!r}")
+        if spec[0] == "enum":
+            if value not in spec[2]:
+                raise ValueError(f"{unit} {param}: expected one of {spec[2]}")
+            eff.params[param] = value
+        else:  # continuous: explicit 0-100 percent -> 0.0-1.0
+            eff.params[param] = max(0.0, min(1.0, float(value) / 100.0))
+
+    def _validate_fx_param(
+        self, unit: str, param: str, allow_enum: bool = True
+    ) -> None:
+        if unit not in EFFECT_CLASSES:
+            raise ValueError(f"unknown effect unit {unit!r}")
+        spec = EFFECT_PARAMS[unit].get(param)
+        if spec is None:
+            raise ValueError(f"{unit}: unknown param {param!r}")
+        if not allow_enum and spec[0] == "enum":
+            raise ValueError(f"{unit} {param} is enumerated; bind it to a note")
+        self._ensure_effect(unit)  # so snap-on-bind has something to drive
+
+    @staticmethod
+    def _fmt_param(unit: str, param: str, value: Any) -> str:
+        return format_effect_param(unit, param, value)
+
+    def _pt_group(self) -> list[tuple[str, int]]:
+        eff = self.engine.effects.get("pt")
+        if eff is None or eff.group is None:
+            raise ValueError("assign a group first: fx pt group <grp>")
+        return self.groups.get(eff.group, [])
+
+    def _capture_pt_home(self) -> None:
+        # snapshot each group fixture's current pan/tilt output as its home
+        for label, number in self._pt_group():
+            fx = self._fixture(label, number)
+            po = fx.profile.offset("pan")
+            to = fx.profile.offset("tilt")
+            pan = self.engine.live[fx.base + po] if po is not None else 128
+            tilt = self.engine.live[fx.base + to] if to is not None else 128
+            self.homes[(label, number)] = (pan, tilt)
+        self._rebind_effects()
+
+    def _set_pt_home_all(self, pan: int, tilt: int) -> None:
+        for ref in self._pt_group():
+            self.homes[ref] = (pan, tilt)
+        self._rebind_effects()
+
+    def _list_effects(self) -> None:
+        if not self.engine.effects:
+            print("No effects")
+            return
+        for unit, eff in self.engine.effects.items():
+            params = " ".join(
+                f"{k}={self._fmt_param(unit, k, v)}" for k, v in eff.params.items()
+            )
+            state = "active" if eff.is_active() else "off"
+            print(f"fx {unit} group={eff.group} [{state}] {params}")
+
     def _patch(self, profile: str, label: str, rest: list[str]) -> None:
         """patch <profile> <label> <n> [thru <m>] @ <base> [step <stride>]"""
         prof = self.profiles.get(profile)
@@ -782,32 +1080,64 @@ class Interpreter:
                 if offset is not None:
                     self.engine.base[fx.base + offset] = value
         self._labels.add(label)
+        self._rebind_effects()  # new fixtures may join an effect's group
 
     def _apply_cc(self, cc: int, value: int) -> None:
         # called synchronously from MidiCC.poll(); reads bindings dynamically so
         # rebinding/unbinding a cc takes effect without re-registering listeners
-        idx = self.bindings.get(cc)
-        if idx is None or not (0 <= idx < len(self.engine.subs)):
+        tgt = self.bindings.get(cc)
+        if tgt is None:
             return
-        self.engine.subs[idx].intensity = value / 127.0
+        if tgt[0] == "sub":
+            idx = tgt[1]
+            if 0 <= idx < len(self.engine.subs):
+                self.engine.subs[idx].intensity = value / 127.0
+        elif tgt[0] == "fx":
+            _, unit, param = tgt
+            eff = self.engine.effects.get(unit)
+            if eff is not None and param in eff.params:
+                eff.params[param] = value / 127.0  # continuous params only
 
     def _cc_listener(self, cc: int) -> Callable[[int], None]:
         return lambda value: self._apply_cc(cc, value)
 
+    def _wire_cc(self, cc: int) -> None:
+        # one listener per cc (dispatches through _apply_cc); snap to current knob
+        if self.midi is None:
+            return
+        if cc not in self._wired_cc:
+            self.midi.bind_cc(cc, self._cc_listener(cc))
+            self._wired_cc.add(cc)
+        if cc in self.midi.cc_last:
+            self._apply_cc(cc, self.midi.cc_last[cc])
+
+    def _wire_note(self, note: int) -> None:
+        if self.midi is not None and note not in self._wired_notes:
+            self.midi.bind_note(note, self._note_listener(note))
+            self._wired_notes.add(note)
+
     def _note_event(self, note: int, pressed: bool) -> None:
         # called from MidiCC.poll(); reads note_bindings dynamically so
         # re/unbinding takes effect without re-registering listeners
-        action = self.note_bindings.get(note)
-        if action is None or action[0] != "flash":
+        tgt = self.note_bindings.get(note)
+        if tgt is None:
             return
-        idx = action[1]
-        if not (0 <= idx < len(self.engine.subs)):
-            return
-        if pressed:
-            self._flash_saved[note] = self.engine.subs[idx].intensity
-            self.engine.subs[idx].intensity = 1.0
-        elif note in self._flash_saved:
-            self.engine.subs[idx].intensity = self._flash_saved.pop(note)
+        if tgt[0] == "flash":
+            idx = tgt[1]
+            if not (0 <= idx < len(self.engine.subs)):
+                return
+            if pressed:
+                self._flash_saved[note] = self.engine.subs[idx].intensity
+                self.engine.subs[idx].intensity = 1.0
+            elif note in self._flash_saved:
+                self.engine.subs[idx].intensity = self._flash_saved.pop(note)
+        elif tgt[0] == "fx" and pressed:
+            # latch: set the effect param to the bound value and leave it
+            _, unit, param, value = tgt
+            try:
+                self._set_fx_param(unit, param, value)
+            except (ValueError, KeyError):
+                pass
 
     def _note_listener(self, note: int) -> Callable[[bool], None]:
         return lambda pressed: self._note_event(note, pressed)
@@ -837,6 +1167,15 @@ class Interpreter:
             lines.append(f"patch {fx.kind} {fx.label} {fx.number} @ {fx.base + 1}")
         for name, refs in self.groups.items():
             lines.append(f"group {name} = {self._compact_refs(refs)}")
+        # effects after groups (selectors must resolve); then per-fixture homes
+        for unit, eff in self.engine.effects.items():
+            if eff.group is not None:
+                lines.append(f"fx {unit} group {eff.group}")
+            for p, v in eff.params.items():
+                if v != EFFECT_PARAMS[unit][p][1]:  # non-default only
+                    lines.append(f"fx {unit} {p} {self._fmt_param(unit, p, v)}")
+        for (label, number), (pan, tilt) in self.homes.items():
+            lines.append(f"fx pt home {label} {number} {pan} {tilt}")
         # submasters next, so later `sub N at`/`midi bind` lines resolve
         for i, sub in enumerate(self.engine.subs):
             for ci in sub.channels:
@@ -851,10 +1190,18 @@ class Interpreter:
                 f"record cue {i + 1} fade_in {int(cue.fade_in)} "
                 f"fade_out {int(cue.fade_out)} hold {int(cue.hold)}"
             )
-        for cc, idx in sorted(self.bindings.items()):
-            lines.append(f"midi bind cc {cc} sub {idx + 1}")
-        for note, (action, idx) in sorted(self.note_bindings.items()):
-            lines.append(f"midi bind note {note} {action} sub {idx + 1}")
+        for cc, tgt in sorted(self.bindings.items(), key=lambda kv: kv[0]):
+            if tgt[0] == "sub":
+                lines.append(f"midi bind cc {cc} sub {tgt[1] + 1}")
+            else:
+                lines.append(f"midi bind cc {cc} fx {tgt[1]} {tgt[2]}")
+        for note, tgt in sorted(self.note_bindings.items(), key=lambda kv: kv[0]):
+            if tgt[0] == "flash":
+                lines.append(f"midi bind note {note} flash sub {tgt[1] + 1}")
+            else:
+                lines.append(
+                    f"midi bind note {note} fx {tgt[1]} {tgt[2]} {tgt[3]}"
+                )
         return lines
 
     async def on_cmd(self, cmd: str) -> str:
@@ -882,16 +1229,13 @@ class Interpreter:
             case ["midi", "bind", "cc", ccnum, "sub", subnum]:
                 cc = int(ccnum)
                 idx = parse_user_index(subnum, self.engine.subs, extend=False)
-                self.bindings[cc] = idx  # always recorded so `save` can emit it
-                if self.midi is not None:
-                    if cc not in self._wired_cc:
-                        # one listener per cc; it dispatches through _apply_cc,
-                        # which reads self.bindings dynamically
-                        self.midi.bind_cc(cc, self._cc_listener(cc))
-                        self._wired_cc.add(cc)
-                    # snap the fader to the knob's current position
-                    if cc in self.midi.cc_last:
-                        self._apply_cc(cc, self.midi.cc_last[cc])
+                self.bindings[cc] = ("sub", idx)
+                self._wire_cc(cc)
+            case ["midi", "bind", "cc", ccnum, "fx", unit, param]:
+                cc = int(ccnum)
+                self._validate_fx_param(unit, param, allow_enum=False)
+                self.bindings[cc] = ("fx", unit, param)
+                self._wire_cc(cc)
             case ["midi", "bind", "cc", ccnum]:
                 # target omitted -> unbind (listener stays but no-ops)
                 self.bindings.pop(int(ccnum), None)
@@ -899,9 +1243,12 @@ class Interpreter:
                 note = int(notenum)
                 idx = parse_user_index(subnum, self.engine.subs, extend=False)
                 self.note_bindings[note] = ("flash", idx)
-                if self.midi is not None and note not in self._wired_notes:
-                    self.midi.bind_note(note, self._note_listener(note))
-                    self._wired_notes.add(note)
+                self._wire_note(note)
+            case ["midi", "bind", "note", notenum, "fx", unit, param, value]:
+                note = int(notenum)
+                self._validate_fx_param(unit, param)
+                self.note_bindings[note] = ("fx", unit, param, value)
+                self._wire_note(note)
             case ["midi", "bind", "note", notenum]:
                 # action omitted -> unbind (listener stays but no-ops)
                 self.note_bindings.pop(int(notenum), None)
@@ -914,6 +1261,7 @@ class Interpreter:
                 if remainder:
                     raise ValueError(f"unknown fixtures in group: {remainder}")
                 self.groups[name] = [(fx.label, fx.number) for fx in fixtures]
+                self._rebind_effects()  # group membership may have changed
             case ["fix" | "fixture"]:
                 if self.fixtures:
                     for fx in self.fixtures.values():
@@ -927,6 +1275,24 @@ class Interpreter:
                 if not attrs:
                     raise ValueError("nothing to set")
                 self._apply_fix(fixtures, attrs)
+            case ["fx"]:
+                self._list_effects()
+            case ["fx", unit, "group", grp]:
+                if grp not in self.groups:
+                    raise ValueError(f"unknown group {grp!r}")
+                self._ensure_effect(unit).group = grp
+                self._rebind_effects()
+            case ["fx", unit, "off"]:
+                self._set_fx_param(unit, "intensity", "0")
+            case ["fx", "pt", "home"]:
+                self._capture_pt_home()
+            case ["fx", "pt", "home", pan, tilt]:
+                self._set_pt_home_all(int(pan), int(tilt))
+            case ["fx", "pt", "home", label, num, pan, tilt]:
+                self.homes[(label, int(num))] = (int(pan), int(tilt))
+                self._rebind_effects()
+            case ["fx", unit, param, value]:
+                self._set_fx_param(unit, param, value)
             case ["record", ("cue" | "sub") as target, cue_num, *args]:
                 # record cue 1 time 3
                 fade_in = 0
@@ -1010,10 +1376,23 @@ class Interpreter:
                     )
                 for name, refs in self.groups.items():
                     print(f"group {name} = {self._compact_refs(refs)}")
-                for cc, idx in sorted(self.bindings.items()):
-                    print(f"bind cc {cc} -> sub {idx + 1}")
-                for note, (action, idx) in sorted(self.note_bindings.items()):
-                    print(f"bind note {note} -> {action} sub {idx + 1}")
+                self._list_effects()
+                for cc, tgt in sorted(self.bindings.items(), key=lambda kv: kv[0]):
+                    dst = (
+                        f"sub {tgt[1] + 1}"
+                        if tgt[0] == "sub"
+                        else f"fx {tgt[1]} {tgt[2]}"
+                    )
+                    print(f"bind cc {cc} -> {dst}")
+                for note, tgt in sorted(
+                    self.note_bindings.items(), key=lambda kv: kv[0]
+                ):
+                    dst = (
+                        f"flash sub {tgt[1] + 1}"
+                        if tgt[0] == "flash"
+                        else f"fx {tgt[1]} {tgt[2]} {tgt[3]}"
+                    )
+                    print(f"bind note {note} -> {dst}")
             case ["save"] | ["save", _]:
                 # match lowercased the line, so recover the path from the
                 # original cmd to keep case-sensitive paths intact
@@ -1083,6 +1462,7 @@ async def main(
     grid = DmxGrid(dmx_source, lambda: bytes(engine.last_source), label)
     interpreter.grid = grid
     midi_view = MidiView(midi)
+    fx_view = FxView(engine)
 
     history = FileHistory(os.path.expanduser("~/.aioartnet-console-history"))
 
@@ -1133,6 +1513,13 @@ async def main(
                 height=MidiView.HEIGHT,
                 wrap_lines=True,
                 style="class:midi",
+            ),
+            Window(height=1, char="─", style="class:sep"),
+            Window(
+                content=FormattedTextControl(fx_view.render),
+                height=FxView.HEIGHT,
+                wrap_lines=True,
+                style="class:fx",
             ),
             Window(height=1, char="─", style="class:sep"),
             Window(

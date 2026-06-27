@@ -193,7 +193,7 @@ async def test_midi_bind_applies_cc_to_submaster() -> None:
     await interpreter.on_cmd("chan 1 at f")
     await interpreter.on_cmd("record sub 1")
     await interpreter.on_cmd("midi bind cc 70 sub 1")
-    assert interpreter.bindings == {70: 0}
+    assert interpreter.bindings == {70: ("sub", 0)}
 
     fake.feed([CONTROLLER_CHANGE, 70, 127])
     midi.poll()
@@ -221,7 +221,7 @@ async def test_midi_rebind_does_not_stack_listeners() -> None:
     await interpreter.on_cmd("midi bind cc 70 sub 1")
     await interpreter.on_cmd("midi bind cc 70 sub 2")
     assert len(midi.cc_listeners[70]) == 1
-    assert interpreter.bindings == {70: 1}
+    assert interpreter.bindings == {70: ("sub", 1)}
 
     fake.feed([CONTROLLER_CHANGE, 70, 127])
     midi.poll()
@@ -293,13 +293,13 @@ async def test_midi_bind_without_device_records_binding() -> None:
     await interpreter.on_cmd("chan 1 at f")
     await interpreter.on_cmd("record sub 1")
     await interpreter.on_cmd("midi bind cc 70 sub 1")
-    assert interpreter.bindings == {70: 0}
+    assert interpreter.bindings == {70: ("sub", 0)}
 
 
 def test_apply_cc_out_of_range_is_noop() -> None:
     engine = Engine(Mock(), universe_size=20)
     interpreter = Interpreter(engine)
-    interpreter.bindings = {70: 5}  # no such submaster
+    interpreter.bindings = {70: ("sub", 5)}  # no such submaster
     interpreter._apply_cc(70, 127)  # must not raise
 
 
@@ -478,3 +478,169 @@ async def test_fixture_default_holds_base_layer() -> None:
     await it.on_cmd("chan 3 at z")  # 1-based chan 3 == index 2
     assert out[2] == 0
     assert engine.last_source[2] == SRC_LIVE
+
+
+def _captured(engine: Engine) -> bytearray:
+    # the bytearray passed to the last handler call
+    return engine.handler.call_args[0][0]  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_fx_rgb_drives_group_with_provenance() -> None:
+    from aioartnet.console import SRC_FX, SRC_LIVE
+
+    engine = Engine(Mock(), universe_size=60)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    # rgba_wash: dimmer,red,green,blue,amber -> red/green/blue at offsets 1,2,3
+    await it.on_cmd("patch rgba_wash w 1 thru 2 @ 1")  # footprint 5 -> base 0,5
+    await it.on_cmd("group ws = w 1 thru 2")
+    await it.on_cmd("fx rgb group ws")
+    await it.on_cmd("fx rgb style rainbow")
+    await it.on_cmd("fx rgb spread 0")
+    await it.on_cmd("fx rgb speed 0")
+    await it.on_cmd("fx rgb intensity 100")
+    await engine.poll(0.0)
+
+    live = _captured(engine)
+    assert (live[1], live[2], live[3]) == (255, 0, 0)  # rainbow phase 0 = red
+    assert engine.last_source[1] == SRC_FX
+
+    # intensity scales brightness
+    await it.on_cmd("fx rgb intensity 50")
+    await engine.poll(0.0)
+    assert _captured(engine)[1] == 128  # round(255 * 0.5)
+
+    # intensity 0 releases the channels (no longer SRC_FX)
+    await it.on_cmd("fx rgb off")
+    await engine.poll(0.0)
+    assert engine.last_source[1] != SRC_FX
+
+    # a live edit punches over a running effect
+    await it.on_cmd("fx rgb intensity 100")
+    await it.on_cmd("live on")
+    await it.on_cmd("fix w 2 red 50")  # w2 base 5, red offset 1 -> chan 6
+    await engine.poll(0.0)
+    assert engine.last_source[6] == SRC_LIVE
+    assert _captured(engine)[6] == 128
+    assert engine.last_source[1] == SRC_FX  # w1 still effect-driven
+
+
+@pytest.mark.asyncio
+async def test_fx_rgb_spread_offsets_fixtures() -> None:
+    engine = Engine(Mock(), universe_size=60)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    await it.on_cmd("patch rgba_wash w 1 thru 2 @ 1")
+    await it.on_cmd("group ws = w 1 thru 2")
+    await it.on_cmd("fx rgb group ws")
+    await it.on_cmd("fx rgb speed 0")
+    await it.on_cmd("fx rgb intensity 100")
+
+    await it.on_cmd("fx rgb spread 0")
+    await engine.poll(0.0)
+    live = _captured(engine)
+    assert (live[1], live[2], live[3]) == (live[6], live[7], live[8])  # unison
+
+    await it.on_cmd("fx rgb spread 50")
+    await engine.poll(0.0)
+    live = _captured(engine)
+    assert (live[1], live[2], live[3]) != (live[6], live[7], live[8])  # offset
+
+
+@pytest.mark.asyncio
+async def test_fx_pt_home_and_movement() -> None:
+    engine = Engine(Mock(), universe_size=60)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    await it.on_cmd("patch star_wash_bl h 1 @ 1")  # pan@0, tilt@1
+    await it.on_cmd("group heads = h 1")
+    await it.on_cmd("fx pt group heads")
+    await it.on_cmd("fx pt home 100 100")
+    await it.on_cmd("fx pt mode circle")
+    await it.on_cmd("fx pt size 100")
+    await it.on_cmd("fx pt speed 0")
+    await it.on_cmd("fx pt intensity 100")
+
+    await engine.poll(0.0)  # theta 0 -> cos=1,sin=0 -> pan=home+amp, tilt=home
+    live = _captured(engine)
+    assert (live[0], live[1]) == (227, 100)
+
+    await it.on_cmd("fx pt mode static")  # holds exactly home
+    await engine.poll(0.0)
+    live = _captured(engine)
+    assert (live[0], live[1]) == (100, 100)
+
+
+@pytest.mark.asyncio
+async def test_fx_pt_home_capture() -> None:
+    engine = Engine(Mock(), universe_size=60)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    await it.on_cmd("patch star_wash_bl h 1 @ 1")
+    await it.on_cmd("group heads = h 1")
+    await it.on_cmd("fx pt group heads")
+
+    # point the head by hand, then capture the current output as home
+    await it.on_cmd("live on")
+    await it.on_cmd("fix h 1 pan 40 tilt 60")
+    await engine.poll(0.0)
+    await it.on_cmd("fx pt home")
+    assert it.homes[("h", 1)] == (102, 153)  # parse_intensity(40)=102, (60)=153
+
+
+@pytest.mark.asyncio
+async def test_fx_cc_and_note_bindings() -> None:
+    from aioartnet.console import CONTROLLER_CHANGE, NOTE_ON, MidiCC
+
+    engine = Engine(Mock(), universe_size=60)
+    fake = _FakeMidiIn()
+    midi = MidiCC(fake)
+    it = Interpreter(engine, midi=midi, profiles=_fixture_profiles())
+    await it.on_cmd("patch rgba_wash w 1 @ 1")
+    await it.on_cmd("group ws = w 1")
+    await it.on_cmd("fx rgb group ws")
+
+    # CC drives a continuous param
+    await it.on_cmd("midi bind cc 74 fx rgb intensity")
+    fake.feed([CONTROLLER_CHANGE, 74, 64])
+    midi.poll()
+    assert engine.effects["rgb"].params["intensity"] == 64 / 127.0
+
+    # a CC cannot bind an enum param
+    with pytest.raises(ValueError):
+        await it.on_cmd("midi bind cc 75 fx rgb style")
+
+    # a note latches an enum param and it persists after release
+    await it.on_cmd("midi bind note 76 fx rgb style ocean")
+    fake.feed([NOTE_ON, 76, 100])
+    midi.poll()
+    assert engine.effects["rgb"].params["style"] == "ocean"
+    fake.feed([[0x80, 76, 0]][0])  # note off
+    midi.poll()
+    assert engine.effects["rgb"].params["style"] == "ocean"  # latched
+
+
+@pytest.mark.asyncio
+async def test_fx_save_round_trip() -> None:
+    profiles = _fixture_profiles()
+    src = Interpreter(Engine(Mock(), universe_size=60), profiles=profiles)
+    await src.on_cmd("patch rgba_wash w 1 thru 2 @ 1")
+    await src.on_cmd("patch star_wash_bl h 1 @ 20")
+    await src.on_cmd("group ws = w 1 thru 2")
+    await src.on_cmd("group heads = h 1")
+    await src.on_cmd("fx rgb group ws")
+    await src.on_cmd("fx rgb style ocean")
+    await src.on_cmd("fx rgb speed 40")
+    await src.on_cmd("fx pt group heads")
+    await src.on_cmd("fx pt home 100 120")
+    await src.on_cmd("midi bind cc 74 fx rgb intensity")
+    await src.on_cmd("midi bind note 76 fx rgb style rainbow")
+
+    dst = Interpreter(Engine(Mock(), universe_size=60), profiles=profiles)
+    for line in src.serialise():
+        if not line.startswith("#"):
+            await dst.on_cmd(line)
+
+    assert dst.engine.effects["rgb"].params == src.engine.effects["rgb"].params
+    assert dst.engine.effects["rgb"].group == src.engine.effects["rgb"].group
+    assert dst.engine.effects["pt"].group == src.engine.effects["pt"].group
+    assert dst.homes == src.homes
+    assert dst.bindings == src.bindings
+    assert dst.note_bindings == src.note_bindings
