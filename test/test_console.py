@@ -143,12 +143,12 @@ def test_midi_cc_tracking() -> None:
     )
     seen: list[int] = []
     midi = MidiCC(fake)
-    midi.bind_cc(70, seen.append)
+    midi.bind_cc((0, 70), seen.append)
     midi.poll()
 
     # held keys are tracked, last CC values recorded, listener fired
-    assert midi.notes_on == {60: 99, 64: 80}
-    assert midi.cc_last == {70: 100, 74: 20}
+    assert midi.notes_on == {(0, 60): 99, (0, 64): 80}
+    assert midi.cc_last == {(0, 70): 100, (0, 74): 20}
     assert seen == [100]
 
     # note-off and note-on-with-velocity-0 both release the key
@@ -156,7 +156,7 @@ def test_midi_cc_tracking() -> None:
     midi.poll()
     assert midi.notes_on == {}
     # cc_last persists every channel ever seen
-    assert midi.cc_last == {70: 100, 74: 20}
+    assert midi.cc_last == {(0, 70): 100, (0, 74): 20}
 
 
 @pytest.mark.asyncio
@@ -193,7 +193,7 @@ async def test_midi_bind_applies_cc_to_submaster() -> None:
     await interpreter.on_cmd("chan 1 at f")
     await interpreter.on_cmd("record sub 1")
     await interpreter.on_cmd("midi bind cc 70 sub 1")
-    assert interpreter.bindings == {70: ("sub", 0)}
+    assert interpreter.bindings == {(0, 70): ("sub", 0)}
 
     fake.feed([CONTROLLER_CHANGE, 70, 127])
     midi.poll()
@@ -220,8 +220,8 @@ async def test_midi_rebind_does_not_stack_listeners() -> None:
 
     await interpreter.on_cmd("midi bind cc 70 sub 1")
     await interpreter.on_cmd("midi bind cc 70 sub 2")
-    assert len(midi.cc_listeners[70]) == 1
-    assert interpreter.bindings == {70: ("sub", 1)}
+    assert len(midi.cc_listeners[(0, 70)]) == 1
+    assert interpreter.bindings == {(0, 70): ("sub", 1)}
 
     fake.feed([CONTROLLER_CHANGE, 70, 127])
     midi.poll()
@@ -241,7 +241,7 @@ async def test_midi_note_flashes_submaster() -> None:
     await it.on_cmd("chan 1 at f")
     await it.on_cmd("record sub 1")  # sub 1 fader starts at 0.0
     await it.on_cmd("midi bind note 36 flash sub 1")
-    assert it.note_bindings == {36: ("flash", 0)}
+    assert it.note_bindings == {(0, 36): ("flash", 0)}
 
     # press -> full while held
     fake.feed([NOTE_ON, 36, 100])
@@ -259,7 +259,7 @@ async def test_midi_note_flashes_submaster() -> None:
     assert engine.subs[0].intensity == 0.0
 
     # round-trips through the show file, and unbinds
-    assert "midi bind note 36 flash sub 1" in it.serialise()
+    assert "midi bind note 0:36 flash sub 1" in it.serialise()
     await it.on_cmd("midi bind note 36")
     assert it.note_bindings == {}
 
@@ -293,14 +293,14 @@ async def test_midi_bind_without_device_records_binding() -> None:
     await interpreter.on_cmd("chan 1 at f")
     await interpreter.on_cmd("record sub 1")
     await interpreter.on_cmd("midi bind cc 70 sub 1")
-    assert interpreter.bindings == {70: ("sub", 0)}
+    assert interpreter.bindings == {(0, 70): ("sub", 0)}
 
 
 def test_apply_cc_out_of_range_is_noop() -> None:
     engine = Engine(Mock(), universe_size=20)
     interpreter = Interpreter(engine)
-    interpreter.bindings = {70: ("sub", 5)}  # no such submaster
-    interpreter._apply_cc(70, 127)  # must not raise
+    interpreter.bindings = {(0, 70): ("sub", 5)}  # no such submaster
+    interpreter._apply_cc((0, 70), 127)  # must not raise
 
 
 @pytest.mark.asyncio
@@ -644,3 +644,140 @@ async def test_fx_save_round_trip() -> None:
     assert dst.homes == src.homes
     assert dst.bindings == src.bindings
     assert dst.note_bindings == src.note_bindings
+
+
+@pytest.mark.asyncio
+async def test_view_trim_serialises() -> None:
+    from aioartnet.console import DmxGrid
+
+    engine = Engine(Mock(), universe_size=64)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    grid = DmxGrid(lambda: bytes(64), lambda: bytes(64))
+    grid.trim_source = it._patched_extent
+    it.grid = grid
+
+    # default view is not emitted
+    assert not any(line.startswith("view") for line in it.serialise())
+
+    await it.on_cmd("view pct trim")
+    assert grid.mode == "pct" and grid.trim is True
+    assert "view pct trim" in it.serialise()
+
+    # replay onto a fresh grid restores the setting
+    engine2 = Engine(Mock(), universe_size=64)
+    it2 = Interpreter(engine2, profiles=_fixture_profiles())
+    grid2 = DmxGrid(lambda: bytes(64), lambda: bytes(64))
+    grid2.trim_source = it2._patched_extent
+    it2.grid = grid2
+    for line in it.serialise():
+        if not line.startswith("#"):
+            await it2.on_cmd(line)
+    assert grid2.mode == "pct" and grid2.trim is True
+
+
+@pytest.mark.asyncio
+async def test_midi_channel_disambiguates_notes() -> None:
+    from aioartnet.console import NOTE_ON, MidiCC, parse_chan_num
+
+    assert parse_chan_num("9:36") == (9, 36)
+    assert parse_chan_num("36") == (0, 36)  # bare -> channel 0
+
+    engine = Engine(Mock(), universe_size=20)
+    fake = _FakeMidiIn()
+    midi = MidiCC(fake)
+    it = Interpreter(engine, midi=midi, profiles=None)
+
+    await it.on_cmd("chan 1 at f")
+    await it.on_cmd("record sub 1")
+    await it.on_cmd("chan 2 at f")
+    await it.on_cmd("record sub 2")
+
+    # same note number 36, different channels -> two distinct bindings
+    await it.on_cmd("midi bind note 0:36 flash sub 1")  # keybed
+    await it.on_cmd("midi bind note 9:36 flash sub 2")  # pad
+    assert it.note_bindings == {(0, 36): ("flash", 0), (9, 36): ("flash", 1)}
+
+    # a pad press (channel 9) flashes sub 2 only, keybed (sub 1) untouched
+    fake.feed([NOTE_ON | 9, 36, 100])
+    midi.poll()
+    assert engine.subs[1].intensity == 1.0
+    assert engine.subs[0].intensity == 0.0
+
+    # a keybed press (channel 0) flashes sub 1 only
+    fake.feed([NOTE_ON | 0, 36, 100])
+    midi.poll()
+    assert engine.subs[0].intensity == 1.0
+
+    # both round-trip through the show file with their channels
+    show = it.serialise()
+    assert "midi bind note 0:36 flash sub 1" in show
+    assert "midi bind note 9:36 flash sub 2" in show
+
+
+@pytest.mark.asyncio
+async def test_fx_rgb_over_mixed_profile_group() -> None:
+    from aioartnet.console import SRC_FX
+
+    engine = Engine(Mock(), universe_size=60)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    # rgba_wash: red/green/blue at offsets 1,2,3 (base 0)
+    await it.on_cmd("patch rgba_wash w 1 @ 1")
+    # star_wash_bl: red/green/blue at offsets 3,4,5 (base 20 -> chan 19)
+    await it.on_cmd("patch star_wash_bl h 1 @ 20")
+    await it.on_cmd("group all = w 1 h 1")  # mixed-profile group
+
+    await it.on_cmd("fx rgb group all")
+    await it.on_cmd("fx rgb style rainbow")
+    await it.on_cmd("fx rgb spread 0")
+    await it.on_cmd("fx rgb speed 0")
+    await it.on_cmd("fx rgb intensity 100")
+    await engine.poll(0.0)
+
+    live = _captured(engine)
+    # rainbow phase 0 = red on BOTH fixtures' red/green/blue
+    assert (live[1], live[2], live[3]) == (255, 0, 0)  # wash
+    assert (live[22], live[23], live[24]) == (255, 0, 0)  # head (base 19 + 3,4,5)
+    assert engine.last_source[1] == SRC_FX
+    assert engine.last_source[22] == SRC_FX
+    # the 4th emitters are left alone (wash amber @4, head white @25)
+    assert live[4] == 0 and live[25] == 0
+
+
+@pytest.mark.asyncio
+async def test_group_listing(capsys) -> None:  # type: ignore[no-untyped-def]
+    engine = Engine(Mock(), universe_size=60)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+
+    await it.on_cmd("group")
+    assert "No groups" in capsys.readouterr().out
+
+    await it.on_cmd("patch rgba_wash w 1 thru 3 @ 1")
+    await it.on_cmd("patch star_wash_bl h 1 @ 20")
+    await it.on_cmd("group all = w 1 thru 3 h 1")
+    await it.on_cmd("group")
+    out = capsys.readouterr().out
+    assert "group all = w 1 thru 3 h 1" in out
+
+
+@pytest.mark.asyncio
+async def test_fixture_attr_listing(capsys) -> None:  # type: ignore[no-untyped-def]
+    engine = Engine(Mock(), universe_size=120)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    await it.on_cmd("patch star_wash_bl head 1 thru 4 @ 1")
+    await it.on_cmd("patch rgba_wash wash 1 @ 60")
+    await it.on_cmd("group heads = head 1 thru 4")
+
+    # selector with no attributes lists what can be set, incl. macro options
+    await it.on_cmd("fixture heads")
+    out = capsys.readouterr().out
+    assert "star_wash_bl" in out
+    assert "gobo (open|stars|moon)" in out
+    assert "color" in out  # rgb present -> shortcut shown
+
+    # a mixed selection shows only the common attributes (intersection)
+    await it.on_cmd("group mixed = head 1 wash 1")
+    await it.on_cmd("fix mixed")
+    out = capsys.readouterr().out
+    assert "red" in out and "green" in out and "blue" in out
+    assert "gobo" not in out  # head-only attr excluded from the common set
+    assert "white" not in out and "amber" not in out

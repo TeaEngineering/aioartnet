@@ -393,6 +393,22 @@ CONTROLLER_CHANGE = 0xB0
 PROGRAM_CHANGE = 0xC0
 CHANNEL_AFTERTOUCH = 0xD0
 
+# notes and CCs are identified by (midi channel, number) so pads and the keybed
+# (which emit on different channels) don't collide; "ch:num" is the text form.
+MidiKey = tuple[int, int]
+
+
+def parse_chan_num(token: str) -> MidiKey:
+    """Parse a 'ch:num' identifier; a bare number defaults to channel 0."""
+    if ":" in token:
+        ch, num = token.split(":", 1)
+        return (int(ch), int(num))
+    return (0, int(token))
+
+
+def fmt_chan_num(key: MidiKey) -> str:
+    return f"{key[0]}:{key[1]}"
+
 
 class MidiCC:
     """Polls a MIDI input, tracking held notes and the latest CC values.
@@ -404,20 +420,25 @@ class MidiCC:
     drains the queue each tick.
     """
 
-    def __init__(self, midi_in: Any, cc_defaults: Optional[dict[int, int]] = None):
+    def __init__(
+        self, midi_in: Any, cc_defaults: Optional[dict[MidiKey, int]] = None
+    ):
         self.midi_in = midi_in
-        self.notes_on: dict[int, int] = {}
+        # all keyed by (midi channel, number)
+        self.notes_on: dict[MidiKey, int] = {}
         # pre-seed CC channels so they appear in the view before any message
-        self.cc_last: dict[int, int] = dict(cc_defaults) if cc_defaults else {}
-        self.cc_pending: dict[int, int] = {}
-        self.cc_listeners: dict[int, list[Callable[[int], None]]] = defaultdict(list)
-        # note listeners get True on press, False on release
-        self.note_listeners: dict[int, list[Callable[[bool], None]]] = defaultdict(
+        self.cc_last: dict[MidiKey, int] = dict(cc_defaults) if cc_defaults else {}
+        self.cc_pending: dict[MidiKey, int] = {}
+        self.cc_listeners: dict[MidiKey, list[Callable[[int], None]]] = defaultdict(
             list
         )
+        # note listeners get True on press, False on release
+        self.note_listeners: dict[MidiKey, list[Callable[[bool], None]]] = (
+            defaultdict(list)
+        )
 
-    def _fire_note(self, note: int, pressed: bool) -> None:
-        for listener in self.note_listeners.get(note, []):
+    def _fire_note(self, key: MidiKey, pressed: bool) -> None:
+        for listener in self.note_listeners.get(key, []):
             listener(pressed)
 
     def poll(self) -> None:
@@ -427,25 +448,28 @@ class MidiCC:
             if not msg:
                 break
             message, _timedelta = msg
+            chan = message[0] & 0x0F
             status = message[0] & 0xF0
             if status == CONTROLLER_CHANGE:
-                self.cc_last[message[1]] = message[2]
-                self.cc_pending[message[1]] = message[2]
+                key = (chan, message[1])
+                self.cc_last[key] = message[2]
+                self.cc_pending[key] = message[2]
             elif status == NOTE_ON:
-                note, vel = message[1], message[2]
+                key, vel = (chan, message[1]), message[2]
                 if vel == 0:  # note-on velocity 0 is conventionally a note-off
-                    if self.notes_on.pop(note, None) is not None:
-                        self._fire_note(note, False)
-                elif note not in self.notes_on:  # only fire on the press edge
-                    self.notes_on[note] = vel
-                    self._fire_note(note, True)
+                    if self.notes_on.pop(key, None) is not None:
+                        self._fire_note(key, False)
+                elif key not in self.notes_on:  # only fire on the press edge
+                    self.notes_on[key] = vel
+                    self._fire_note(key, True)
                 else:
-                    self.notes_on[note] = vel
+                    self.notes_on[key] = vel
             elif status == NOTE_OFF:
-                if self.notes_on.pop(message[1], None) is not None:
-                    self._fire_note(message[1], False)
+                key = (chan, message[1])
+                if self.notes_on.pop(key, None) is not None:
+                    self._fire_note(key, False)
             elif status == POLY_AFTERTOUCH:
-                self.notes_on[message[1]] = message[2]
+                self.notes_on[(chan, message[1])] = message[2]
             # CHANNEL_AFTERTOUCH / PROGRAM_CHANGE / clock / etc. are ignored
 
         # dispatch CC changes seen this tick to any bound listeners
@@ -454,12 +478,12 @@ class MidiCC:
                 listener(v)
         self.cc_pending.clear()
 
-    def bind_cc(self, channel: int, listener: Callable[[int], None]) -> None:
-        self.cc_listeners[channel].append(listener)
-        self.cc_last.setdefault(channel, 0)
+    def bind_cc(self, key: MidiKey, listener: Callable[[int], None]) -> None:
+        self.cc_listeners[key].append(listener)
+        self.cc_last.setdefault(key, 0)
 
-    def bind_note(self, note: int, listener: Callable[[bool], None]) -> None:
-        self.note_listeners[note].append(listener)
+    def bind_note(self, key: MidiKey, listener: Callable[[bool], None]) -> None:
+        self.note_listeners[key].append(listener)
 
     async def run(self, interval: float = 0.01) -> None:
         while True:
@@ -472,7 +496,7 @@ class MidiCC:
 
 def open_midi_input(
     port: "int | str | None" = None,
-    cc_defaults: Optional[dict[int, int]] = None,
+    cc_defaults: Optional[dict[MidiKey, int]] = None,
 ) -> "MidiCC":
     """Open a MIDI input and wrap it in a MidiCC.
 
@@ -510,7 +534,11 @@ def setup_midi_from_config(
     on; otherwise the config's ``midi.enabled`` decides.
     """
     midi_cfg = config.get("midi", {})
-    cc_defaults = {int(k): int(v) for k, v in midi_cfg.get("cc_defaults", {}).items()}
+    # config cc_defaults keys are "num" (channel 0) or "ch:num"
+    cc_defaults = {
+        parse_chan_num(str(k)): int(v)
+        for k, v in midi_cfg.get("cc_defaults", {}).items()
+    }
 
     if cli_port is not None:
         # explicit --midi-in wins; fall back to the configured device for `-m`
@@ -774,16 +802,16 @@ class MidiView:
 
         frags.append(("class:dim", " keys: "))
         if self.midi.notes_on:
-            for note, vel in sorted(self.midi.notes_on.items()):
-                frags.append(("fg:red", f"{note}:{vel} "))
+            for key, vel in sorted(self.midi.notes_on.items()):
+                frags.append(("fg:red", f"{fmt_chan_num(key)}({vel}) "))
         else:
             frags.append(("class:dim", "-"))
 
         frags.append(("", "\n"))
         frags.append(("class:dim", " cc:   "))
         if self.midi.cc_last:
-            for cc, val in sorted(self.midi.cc_last.items()):
-                frags.append(("fg:black", f"{cc}={val:<3} "))
+            for key, val in sorted(self.midi.cc_last.items()):
+                frags.append(("fg:black", f"{fmt_chan_num(key)}={val:<3} "))
         else:
             frags.append(("class:dim", "-"))
         return frags
@@ -825,13 +853,17 @@ Available commands:
   sub|submaster N at|@ LEVEL        set submaster N to LEVEL
   record cue|sub N [fade D]         record current edits as cue/sub N
             [fade_in D] [fade_out D] [hold D]
+  midi                              list the wired MIDI bindings
   midi bind cc C sub N              bind MIDI CC C to submaster N
   midi bind cc C                    unbind MIDI CC C
   midi bind note K flash sub N      pad K flashes submaster N while held
   midi bind note K                  unbind pad K
+            C and K are 'ch:num' (e.g. 9:36); a bare num means channel 0
   patch PROFILE LBL N [thru M] @ A  patch fixture(s) of PROFILE at address A
   group NAME = SELECTOR             name a group of fixtures
+  group                             list groups and their fixtures
   fix                               list patched fixtures
+  fix SELECTOR                      list the selection's settable attributes
   fix SELECTOR ATTR VAL [...]       set fixture attribute(s)
   fix SELECTOR color #RRGGBB|NAME   set fixture colour (red/green/blue)
   fix SELECTOR at LEVEL             set fixture dimmer
@@ -869,15 +901,15 @@ class Interpreter:
         self.engine = engine
         self.grid = grid
         self.midi = midi
-        # cc -> binding target: ("sub", idx) or ("fx", unit, param)
-        self.bindings: dict[int, tuple] = {}
-        # cc's that already have a live listener attached (avoid stacking)
-        self._wired_cc: set[int] = set()
-        # note -> target: ("flash", idx) or ("fx", unit, param, value)
-        self.note_bindings: dict[int, tuple] = {}
-        self._wired_notes: set[int] = set()
+        # (ch,cc) -> binding target: ("sub", idx) or ("fx", unit, param)
+        self.bindings: dict[MidiKey, tuple] = {}
+        # cc keys that already have a live listener attached (avoid stacking)
+        self._wired_cc: set[MidiKey] = set()
+        # (ch,note) -> target: ("flash", idx) or ("fx", unit, param, value)
+        self.note_bindings: dict[MidiKey, tuple] = {}
+        self._wired_notes: set[MidiKey] = set()
         # intensity saved while a flash is held, restored on release
-        self._flash_saved: dict[int, float] = {}
+        self._flash_saved: dict[MidiKey, float] = {}
         # path of the show file (from --file); target for a bare `save`
         self.showfile_path: Optional[str] = None
         # fixture profiles (from config), patched instances, and groups
@@ -966,6 +998,49 @@ class Interpreter:
                 for fx in fixtures:
                     self._set_attr(fx, attr, tokens[i + 1])
                 i += 2
+
+    @staticmethod
+    def _common_macros(fixtures: list[PatchedFixture], attr: str) -> list[str]:
+        # macro names available on `attr` for every selected fixture, in the
+        # first fixture's order; empty unless all fixtures enumerate it
+        first = fixtures[0].profile.enums.get(attr)
+        if first is None:
+            return []
+        common = set(first)
+        for fx in fixtures[1:]:
+            macros = fx.profile.enums.get(attr)
+            if macros is None:
+                return []
+            common &= set(macros)
+        return [name for name in first if name in common]
+
+    def _show_fixture_attrs(self, fixtures: list[PatchedFixture]) -> None:
+        # attributes common to every selected fixture, in the first's layout
+        common = set(fixtures[0].profile.channels)
+        for fx in fixtures[1:]:
+            common &= set(fx.profile.channels)
+        common -= {"-", ""}
+
+        kinds = ", ".join(dict.fromkeys(fx.kind for fx in fixtures))
+        print(f"{len(fixtures)} fixture(s) [{kinds}], settable attributes:")
+        if not common:
+            print("  (none in common)")
+            return
+        seen: set[str] = set()
+        for attr in fixtures[0].profile.channels:
+            if attr not in common or attr in seen:
+                continue
+            seen.add(attr)
+            macros = self._common_macros(fixtures, attr)
+            print(f"  {attr} ({'|'.join(macros)})" if macros else f"  {attr}")
+        # virtual setters supported by `fix`
+        extras = []
+        if {"red", "green", "blue"} <= common:
+            extras.append("color <#rrggbb|name>")
+        if "dimmer" in common:
+            extras.append("at <level>")
+        if extras:
+            print(f"  shortcuts: {', '.join(extras)}")
 
     # ---- effect units -----------------------------------------------------
     def _ensure_effect(self, unit: str) -> Effect:
@@ -1074,6 +1149,13 @@ class Interpreter:
             self.homes[ref] = (pan, tilt)
         self._rebind_effects()
 
+    def _list_groups(self) -> None:
+        if not self.groups:
+            print("No groups")
+            return
+        for name, refs in self.groups.items():
+            print(f"group {name} = {self._compact_refs(refs)}")
+
     def _list_effects(self) -> None:
         if not self.engine.effects:
             print("No effects")
@@ -1084,6 +1166,23 @@ class Interpreter:
             )
             state = "active" if eff.is_active() else "off"
             print(f"fx {unit} group={eff.group} [{state}] {params}")
+
+    def _list_bindings(self) -> None:
+        if not self.bindings and not self.note_bindings:
+            print("No MIDI bindings")
+            return
+        for key, tgt in sorted(self.bindings.items(), key=lambda kv: kv[0]):
+            dst = (
+                f"sub {tgt[1] + 1}" if tgt[0] == "sub" else f"fx {tgt[1]} {tgt[2]}"
+            )
+            print(f"bind cc {fmt_chan_num(key)} -> {dst}")
+        for key, tgt in sorted(self.note_bindings.items(), key=lambda kv: kv[0]):
+            dst = (
+                f"flash sub {tgt[1] + 1}"
+                if tgt[0] == "flash"
+                else f"fx {tgt[1]} {tgt[2]} {tgt[3]}"
+            )
+            print(f"bind note {fmt_chan_num(key)} -> {dst}")
 
     def _patch(self, profile: str, label: str, rest: list[str]) -> None:
         """patch <profile> <label> <n> [thru <m>] @ <base> [step <stride>]"""
@@ -1122,10 +1221,10 @@ class Interpreter:
         self._labels.add(label)
         self._rebind_effects()  # new fixtures may join an effect's group
 
-    def _apply_cc(self, cc: int, value: int) -> None:
+    def _apply_cc(self, key: MidiKey, value: int) -> None:
         # called synchronously from MidiCC.poll(); reads bindings dynamically so
         # rebinding/unbinding a cc takes effect without re-registering listeners
-        tgt = self.bindings.get(cc)
+        tgt = self.bindings.get(key)
         if tgt is None:
             return
         if tgt[0] == "sub":
@@ -1138,28 +1237,28 @@ class Interpreter:
             if eff is not None and param in eff.params:
                 eff.params[param] = value / 127.0  # continuous params only
 
-    def _cc_listener(self, cc: int) -> Callable[[int], None]:
-        return lambda value: self._apply_cc(cc, value)
+    def _cc_listener(self, key: MidiKey) -> Callable[[int], None]:
+        return lambda value: self._apply_cc(key, value)
 
-    def _wire_cc(self, cc: int) -> None:
+    def _wire_cc(self, key: MidiKey) -> None:
         # one listener per cc (dispatches through _apply_cc); snap to current knob
         if self.midi is None:
             return
-        if cc not in self._wired_cc:
-            self.midi.bind_cc(cc, self._cc_listener(cc))
-            self._wired_cc.add(cc)
-        if cc in self.midi.cc_last:
-            self._apply_cc(cc, self.midi.cc_last[cc])
+        if key not in self._wired_cc:
+            self.midi.bind_cc(key, self._cc_listener(key))
+            self._wired_cc.add(key)
+        if key in self.midi.cc_last:
+            self._apply_cc(key, self.midi.cc_last[key])
 
-    def _wire_note(self, note: int) -> None:
-        if self.midi is not None and note not in self._wired_notes:
-            self.midi.bind_note(note, self._note_listener(note))
-            self._wired_notes.add(note)
+    def _wire_note(self, key: MidiKey) -> None:
+        if self.midi is not None and key not in self._wired_notes:
+            self.midi.bind_note(key, self._note_listener(key))
+            self._wired_notes.add(key)
 
-    def _note_event(self, note: int, pressed: bool) -> None:
+    def _note_event(self, key: MidiKey, pressed: bool) -> None:
         # called from MidiCC.poll(); reads note_bindings dynamically so
         # re/unbinding takes effect without re-registering listeners
-        tgt = self.note_bindings.get(note)
+        tgt = self.note_bindings.get(key)
         if tgt is None:
             return
         if tgt[0] == "flash":
@@ -1167,10 +1266,10 @@ class Interpreter:
             if not (0 <= idx < len(self.engine.subs)):
                 return
             if pressed:
-                self._flash_saved[note] = self.engine.subs[idx].intensity
+                self._flash_saved[key] = self.engine.subs[idx].intensity
                 self.engine.subs[idx].intensity = 1.0
-            elif note in self._flash_saved:
-                self.engine.subs[idx].intensity = self._flash_saved.pop(note)
+            elif key in self._flash_saved:
+                self.engine.subs[idx].intensity = self._flash_saved.pop(key)
         elif tgt[0] == "fx" and pressed:
             # latch: set the effect param to the bound value and leave it
             _, unit, param, value = tgt
@@ -1179,8 +1278,8 @@ class Interpreter:
             except (ValueError, KeyError):
                 pass
 
-    def _note_listener(self, note: int) -> Callable[[bool], None]:
-        return lambda pressed: self._note_event(note, pressed)
+    def _note_listener(self, key: MidiKey) -> Callable[[bool], None]:
+        return lambda pressed: self._note_event(key, pressed)
 
     @staticmethod
     def _compact_refs(refs: list[tuple[str, int]]) -> str:
@@ -1230,12 +1329,14 @@ class Interpreter:
                 f"record cue {i + 1} fade_in {int(cue.fade_in)} "
                 f"fade_out {int(cue.fade_out)} hold {int(cue.hold)}"
             )
-        for cc, tgt in sorted(self.bindings.items(), key=lambda kv: kv[0]):
+        for key, tgt in sorted(self.bindings.items(), key=lambda kv: kv[0]):
+            cc = fmt_chan_num(key)
             if tgt[0] == "sub":
                 lines.append(f"midi bind cc {cc} sub {tgt[1] + 1}")
             else:
                 lines.append(f"midi bind cc {cc} fx {tgt[1]} {tgt[2]}")
-        for note, tgt in sorted(self.note_bindings.items(), key=lambda kv: kv[0]):
+        for key, tgt in sorted(self.note_bindings.items(), key=lambda kv: kv[0]):
+            note = fmt_chan_num(key)
             if tgt[0] == "flash":
                 lines.append(f"midi bind note {note} flash sub {tgt[1] + 1}")
             else:
@@ -1269,34 +1370,38 @@ class Interpreter:
                 cn = parse_user_index(chan, self.engine.subs, extend=False)
                 # submaster intensity is a 0.0-1.0 fader scaling recorded levels
                 self.engine.subs[cn].intensity = intensity / 255.0
+            case ["midi"]:
+                self._list_bindings()
             case ["midi", "bind", "cc", ccnum, "sub", subnum]:
-                cc = int(ccnum)
+                key = parse_chan_num(ccnum)
                 idx = parse_user_index(subnum, self.engine.subs, extend=False)
-                self.bindings[cc] = ("sub", idx)
-                self._wire_cc(cc)
+                self.bindings[key] = ("sub", idx)
+                self._wire_cc(key)
             case ["midi", "bind", "cc", ccnum, "fx", unit, param]:
-                cc = int(ccnum)
+                key = parse_chan_num(ccnum)
                 self._validate_fx_param(unit, param, allow_enum=False)
-                self.bindings[cc] = ("fx", unit, param)
-                self._wire_cc(cc)
+                self.bindings[key] = ("fx", unit, param)
+                self._wire_cc(key)
             case ["midi", "bind", "cc", ccnum]:
                 # target omitted -> unbind (listener stays but no-ops)
-                self.bindings.pop(int(ccnum), None)
+                self.bindings.pop(parse_chan_num(ccnum), None)
             case ["midi", "bind", "note", notenum, "flash", "sub", subnum]:
-                note = int(notenum)
+                key = parse_chan_num(notenum)
                 idx = parse_user_index(subnum, self.engine.subs, extend=False)
-                self.note_bindings[note] = ("flash", idx)
-                self._wire_note(note)
+                self.note_bindings[key] = ("flash", idx)
+                self._wire_note(key)
             case ["midi", "bind", "note", notenum, "fx", unit, param, value]:
-                note = int(notenum)
+                key = parse_chan_num(notenum)
                 self._validate_fx_param(unit, param)
-                self.note_bindings[note] = ("fx", unit, param, value)
-                self._wire_note(note)
+                self.note_bindings[key] = ("fx", unit, param, value)
+                self._wire_note(key)
             case ["midi", "bind", "note", notenum]:
                 # action omitted -> unbind (listener stays but no-ops)
-                self.note_bindings.pop(int(notenum), None)
+                self.note_bindings.pop(parse_chan_num(notenum), None)
             case ["patch", profile, label, *rest]:
                 self._patch(profile, label, rest)
+            case ["group"]:
+                self._list_groups()
             case ["group", name, *sel]:
                 if sel and sel[0] == "=":
                     sel = sel[1:]
@@ -1316,8 +1421,10 @@ class Interpreter:
                 if not fixtures:
                     raise ValueError("no fixtures selected")
                 if not attrs:
-                    raise ValueError("nothing to set")
-                self._apply_fix(fixtures, attrs)
+                    # a selector with no attributes lists what can be set
+                    self._show_fixture_attrs(fixtures)
+                else:
+                    self._apply_fix(fixtures, attrs)
             case ["fx"]:
                 self._list_effects()
             case ["fx", unit, "group", grp]:
@@ -1417,25 +1524,9 @@ class Interpreter:
                         f"fixture {fx.label} {fx.number} "
                         f"({fx.kind}) @ {fx.base + 1}"
                     )
-                for name, refs in self.groups.items():
-                    print(f"group {name} = {self._compact_refs(refs)}")
+                self._list_groups()
                 self._list_effects()
-                for cc, tgt in sorted(self.bindings.items(), key=lambda kv: kv[0]):
-                    dst = (
-                        f"sub {tgt[1] + 1}"
-                        if tgt[0] == "sub"
-                        else f"fx {tgt[1]} {tgt[2]}"
-                    )
-                    print(f"bind cc {cc} -> {dst}")
-                for note, tgt in sorted(
-                    self.note_bindings.items(), key=lambda kv: kv[0]
-                ):
-                    dst = (
-                        f"flash sub {tgt[1] + 1}"
-                        if tgt[0] == "flash"
-                        else f"fx {tgt[1]} {tgt[2]} {tgt[3]}"
-                    )
-                    print(f"bind note {note} -> {dst}")
+                self._list_bindings()
             case ["save"] | ["save", _]:
                 # match lowercased the line, so recover the path from the
                 # original cmd to keep case-sensitive paths intact
