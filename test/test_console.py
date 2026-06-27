@@ -1037,3 +1037,33 @@ def test_midi_missing_device_required_aborts(monkeypatch) -> None:  # type: igno
     cfg = {"midi": {"enabled": True, "device": 0, "required": True}}
     with pytest.raises(SystemExit):
         console.setup_midi_from_config(cfg, None)
+
+
+@pytest.mark.asyncio
+async def test_fx_unit_inspection(capsys) -> None:  # type: ignore[no-untyped-def]
+    engine = Engine(Mock(), universe_size=60)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+
+    # bare `fx rgb` before configuring shows params + enum choices
+    await it.on_cmd("fx rgb")
+    out = capsys.readouterr().out
+    assert "intensity = 0" in out
+    assert "rainbow" in out and "ocean" in out  # style alternatives
+
+    # `fx pt` shows current values, mode choices, and per-fixture home
+    await it.on_cmd("patch star_wash_bl head 1 thru 2 @ 1")
+    await it.on_cmd("group heads = head 1 thru 2")
+    await it.on_cmd("fx pt group heads")
+    await it.on_cmd("fx pt home 100 120")
+    await it.on_cmd("fx pt mode wave")
+    await it.on_cmd("fx pt size 40")
+    capsys.readouterr()  # clear
+    await it.on_cmd("fx pt")
+    out = capsys.readouterr().out
+    assert "mode      = wave" in out
+    assert "static|circle|wave|sway" in out
+    assert "size      = 40" in out
+    assert "head 1 = (100, 120)" in out and "head 2 = (100, 120)" in out
+
+    with pytest.raises(ValueError):
+        await it.on_cmd("fx bogus")

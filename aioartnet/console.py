@@ -955,6 +955,7 @@ Available commands:
   fix SELECTOR at LEVEL             set fixture dimmer
             SELECTOR = LBL N | LBL N thru M | group name
   fx                                list effect units
+  fx rgb|pt                         show a unit's params, values and choices
   fx rgb|pt group GRP               point an effect at a fixture group
   fx UNIT PARAM VALUE               set effect param (0-100, or style/mode name)
             rgb: intensity speed spread style(rainbow|ocean|fire|abstract)
@@ -1392,6 +1393,31 @@ class Interpreter:
             state = "active" if eff.is_active() else "off"
             print(f"fx {unit} group={eff.group} [{state}] {params}")
 
+    def _show_effect(self, unit: str) -> None:
+        spec = EFFECT_PARAMS.get(unit)
+        if spec is None:
+            raise ValueError(f"unknown effect unit {unit!r}")
+        eff = self.engine.effects.get(unit)
+        if eff is not None:
+            state = "active" if eff.is_active() else "off"
+            print(f"fx {unit}  group={eff.group}  [{state}]")
+        else:
+            print(f"fx {unit}  (not configured)")
+        width = max(len(p) for p in spec)
+        for param, s in spec.items():
+            value = eff.params[param] if eff is not None else s[1]
+            line = f"  {param:<{width}} = {format_effect_param(unit, param, value)}"
+            if s[0] == "enum":  # show the alternatives for style/mode
+                line += f"   ({'|'.join(s[2])})"
+            print(line)
+        # for pt, also list each group fixture's home (rest) position
+        if unit == "pt" and eff is not None and eff.group is not None:
+            print("  home:")
+            for label, number in self.groups.get(eff.group, []):
+                fx = self._fixture(label, number)
+                pan, tilt = self.homes.get((label, number)) or self._default_home(fx)
+                print(f"    {label} {number} = ({pan}, {tilt})")
+
     def _list_bindings(self) -> None:
         if not self.bindings and not self.note_bindings:
             print("No MIDI bindings")
@@ -1680,6 +1706,8 @@ class Interpreter:
                     self._apply_fix(fixtures, attrs)
             case ["fx"]:
                 self._list_effects()
+            case ["fx", unit]:
+                self._show_effect(unit)
             case ["fx", unit, "group", grp]:
                 if grp not in self.groups:
                     raise ValueError(f"unknown group {grp!r}")
