@@ -875,7 +875,8 @@ Available commands:
   group NAME = SELECTOR             name a group of fixtures
   group                             list groups and their fixtures
   fix                               list patched fixtures
-  fix SELECTOR                      list the selection's settable attributes
+  fix SELECTOR                      inspect a fixture (chans+values), or list
+                                    a group's common settable attributes
   fix SELECTOR ATTR VAL [...]       set fixture attribute(s)
   fix SELECTOR color #RRGGBB|NAME   set fixture colour (red/green/blue)
   fix SELECTOR at LEVEL             set fixture dimmer
@@ -1026,7 +1027,33 @@ class Interpreter:
             common &= set(macros)
         return [name for name in first if name in common]
 
+    def _show_fixture_detail(self, fx: PatchedFixture) -> None:
+        # per-channel inspection: relative + absolute DMX channel and live value
+        print(f"{fx.label} {fx.number} ({fx.kind}) @ {fx.base + 1}")
+        live = self.engine.live
+        width = max((len(a) for a in fx.profile.channels), default=4)
+        for offset, attr in enumerate(fx.profile.channels):
+            if attr in ("-", ""):
+                continue
+            abs_ch = fx.base + offset
+            value = live[abs_ch] if abs_ch < len(live) else 0
+            line = (
+                f"  {attr:<{width}}  rel {offset + 1:>2}  "
+                f"abs {abs_ch + 1:>3}  = {value:>3}"
+            )
+            macros = fx.profile.enums.get(attr)
+            if macros:
+                name = next((k for k, v in macros.items() if v == value), None)
+                if name is not None:
+                    line += f"  {name}"
+                line += f"  ({'|'.join(macros)})"
+            print(line)
+
     def _show_fixture_attrs(self, fixtures: list[PatchedFixture]) -> None:
+        # a single fixture gets a full per-channel inspection
+        if len(fixtures) == 1:
+            self._show_fixture_detail(fixtures[0])
+            return
         # attributes common to every selected fixture, in the first's layout
         common = set(fixtures[0].profile.channels)
         for fx in fixtures[1:]:
