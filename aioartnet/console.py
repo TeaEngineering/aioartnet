@@ -506,6 +506,17 @@ class MidiCC:
         return f"CC: {self.cc_last}\nNotes: {self.notes_on}"
 
 
+class _NoMidiInput:
+    """A stand-in MIDI input that never yields a message.
+
+    Used when MIDI is enabled but no device is available and not required: the
+    MidiCC and its bindings stay wired so mappings persist, but no events fire.
+    """
+
+    def get_message(self) -> None:
+        return None
+
+
 def open_midi_input(
     port: "int | str | None" = None,
     cc_defaults: Optional[dict[MidiKey, int]] = None,
@@ -513,10 +524,12 @@ def open_midi_input(
     """Open a MIDI input and wrap it in a MidiCC.
 
     ``port`` may be an integer device index or a substring of the port name.
+    Raises if the device cannot be opened (e.g. no MIDI ports present).
     """
     from rtmidi.midiutil import open_midiinput  # type: ignore[import-untyped]
 
-    midi_in, _port_name = open_midiinput(port=port)
+    # interactive=False: never prompt; raise cleanly when the port is missing
+    midi_in, _port_name = open_midiinput(port=port, interactive=False)
     return MidiCC(midi_in, cc_defaults=cc_defaults)
 
 
@@ -560,7 +573,14 @@ def setup_midi_from_config(
     else:
         return None
 
-    return open_midi_input(port, cc_defaults=cc_defaults)
+    try:
+        return open_midi_input(port, cc_defaults=cc_defaults)
+    except Exception as e:
+        # required=true aborts; otherwise keep mappings but deliver no events
+        if midi_cfg.get("required", False):
+            raise SystemExit(f"MIDI device required but unavailable: {e}")
+        print(f"warning: MIDI unavailable ({e}); continuing without a device")
+        return MidiCC(_NoMidiInput(), cc_defaults=cc_defaults)
 
 
 def parse_intensity(level: str) -> int:
@@ -807,10 +827,13 @@ class MidiView:
         self.midi = midi
 
     def render(self) -> StyleAndTextTuples:
-        frags: StyleAndTextTuples = [("bold", " MIDI\n")]
+        frags: StyleAndTextTuples = [("bold", " MIDI")]
         if self.midi is None:
-            frags.append(("class:dim", " not enabled (start with --midi-in)"))
+            frags.append(("class:dim", "\n not enabled (start with --midi-in)"))
             return frags
+        if isinstance(self.midi.midi_in, _NoMidiInput):
+            frags.append(("fg:#d08020", "  (no device — mappings held)"))
+        frags.append(("", "\n"))
 
         frags.append(("class:dim", " keys: "))
         if self.midi.notes_on:
@@ -1606,6 +1629,8 @@ class Interpreter:
                     continue
                 try:
                     await self.on_cmd(line)
+                except (ValueError, KeyError) as e:
+                    print(f"{filename}:{lineno}: {e}")
                 except Exception:
                     print(f"{filename}:{lineno}: {traceback.format_exc(limit=-2)}")
 
@@ -1669,6 +1694,8 @@ async def main(
             output = await interpreter.on_cmd(text)
             if output:
                 append_log(output)
+        except (ValueError, KeyError) as e:
+            append_log(f"error: {e}")  # expected user errors: just the message
         except Exception:
             append_log(traceback.format_exc(limit=-2))
 

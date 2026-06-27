@@ -853,3 +853,35 @@ async def test_fixture_inspect_vs_group_summary(capsys) -> None:  # type: ignore
     await it.on_cmd("fixture heads")  # multiple -> common attrs summary
     out = capsys.readouterr().out
     assert "settable attributes" in out and "abs" not in out
+
+
+def test_midi_missing_device_not_required(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import aioartnet.console as console
+
+    def raise_no_device(*a, **k):  # type: ignore[no-untyped-def]
+        raise RuntimeError("No MIDI input ports found.")
+
+    monkeypatch.setattr(console, "open_midi_input", raise_no_device)
+    cfg = {"midi": {"enabled": True, "device": 0, "cc_defaults": {"16": 0}}}
+
+    # not required -> no crash, a no-device MidiCC with mappings held
+    midi = console.setup_midi_from_config(cfg, None)
+    assert isinstance(midi, console.MidiCC)
+    assert isinstance(midi.midi_in, console._NoMidiInput)
+    assert midi.cc_last == {(0, 16): 0}
+
+    # a no-device input simply never yields a message
+    midi.poll()  # must not raise
+    assert midi.notes_on == {}
+
+
+def test_midi_missing_device_required_aborts(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import aioartnet.console as console
+
+    def raise_no_device(*a, **k):  # type: ignore[no-untyped-def]
+        raise RuntimeError("No MIDI input ports found.")
+
+    monkeypatch.setattr(console, "open_midi_input", raise_no_device)
+    cfg = {"midi": {"enabled": True, "device": 0, "required": True}}
+    with pytest.raises(SystemExit):
+        console.setup_midi_from_config(cfg, None)
