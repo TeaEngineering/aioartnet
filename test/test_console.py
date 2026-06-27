@@ -1067,3 +1067,102 @@ async def test_fx_unit_inspection(capsys) -> None:  # type: ignore[no-untyped-de
 
     with pytest.raises(ValueError):
         await it.on_cmd("fx bogus")
+
+
+@pytest.mark.asyncio
+async def test_sub_command_defined_and_faded() -> None:
+    engine = Engine(Mock(), universe_size=60)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    # star_wash_bl: dimmer@2
+    await it.on_cmd("patch star_wash_bl head 1 @ 1")
+    await it.on_cmd("group heads = head 1")
+
+    await it.on_cmd("sub 1 = fix heads dimmer full")
+    assert it.engine.subs[0].commands == ["fix heads dimmer full"]
+    assert {c.channel for c in it.engine.subs[0].channels} == {2}
+
+    # the fader scales the compiled levels (HTP sub-mix): 50% -> 128
+    await it.on_cmd("sub 1 at 50")
+    await engine.poll(0.0)
+    assert _captured(engine)[2] == 128
+
+    # recompiles when the fixtures move
+    await it.on_cmd("patch star_wash_bl head 1 @ 40")  # base 39
+    assert {c.channel for c in it.engine.subs[0].channels} == {41}
+
+
+@pytest.mark.asyncio
+async def test_sub_command_and_recorded_round_trip() -> None:
+    profiles = _fixture_profiles()
+    src = Interpreter(Engine(Mock(), universe_size=60), profiles=profiles)
+    await src.on_cmd("patch star_wash_bl head 1 @ 1")
+    await src.on_cmd("group heads = head 1")
+    await src.on_cmd("sub 1 = fix heads dimmer full")  # command-defined
+    await src.on_cmd("sub 1 at 80")
+    await src.on_cmd("chan 10 at full")  # legacy recorded
+    await src.on_cmd("record sub 2")
+
+    lines = src.serialise()
+    assert "sub 1 = fix heads dimmer full" in lines
+    assert any(line.startswith("record sub 2") for line in lines)
+
+    dst = Interpreter(Engine(Mock(), universe_size=60), profiles=profiles)
+    for line in lines:
+        if not line.startswith("#"):
+            await dst.on_cmd(line)
+    assert dst.engine.subs == src.engine.subs
+
+
+@pytest.mark.asyncio
+async def test_sub_listing_and_view(capsys) -> None:  # type: ignore[no-untyped-def]
+    from aioartnet.console import SubsView
+
+    engine = Engine(Mock(), universe_size=60)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    assert "no subs" in "".join(t for _, t in SubsView(engine).render())
+
+    await it.on_cmd("patch star_wash_bl head 1 @ 1")
+    await it.on_cmd("group heads = head 1")
+    await it.on_cmd("sub 1 = fix heads dimmer full")
+    await it.on_cmd("sub 1 at 80")
+    await it.on_cmd("chan 10 at full")
+    await it.on_cmd("record sub 2")  # recorded
+
+    await it.on_cmd("sub")
+    out = capsys.readouterr().out
+    assert "sub 1 [80]: fix heads dimmer full" in out
+    assert "sub 2 [00]:" in out and "channels (recorded)" in out
+
+    frags = SubsView(engine).render()
+    active = [s for s, t in frags if t.startswith("1:")]
+    assert any("bold" in s for s in active)  # the 80% fader is highlighted
+
+
+@pytest.mark.asyncio
+async def test_list_command_removed() -> None:
+    it = Interpreter(Engine(Mock(), universe_size=20))
+    with pytest.raises(ValueError):
+        await it.on_cmd("list")
+
+
+@pytest.mark.asyncio
+async def test_submaster_provenance_distinct_from_cue() -> None:
+    from aioartnet.console import SRC_STORED, SRC_SUB
+
+    engine = Engine(Mock(), universe_size=20)
+    it = Interpreter(engine)
+    await it.on_cmd("chan 1 at f")
+    await it.on_cmd("record cue 1")
+    await it.on_cmd("go")  # ch1 driven by a cue
+    await it.on_cmd("chan 2 at f")
+    await it.on_cmd("record sub 1")
+    await it.on_cmd("sub 1 at full")  # ch2 driven by a submaster
+    await engine.poll(0.0)
+
+    assert engine.last_source[0] == SRC_STORED  # cue (black)
+    assert engine.last_source[1] == SRC_SUB  # submaster (yellow)
+
+    # fader down releases the sub provenance
+    await it.on_cmd("sub 1 at z")
+    await engine.poll(0.0)
+    assert engine.last_source[1] != SRC_SUB

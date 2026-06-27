@@ -75,6 +75,8 @@ class Submaster:
     intensity: float
     name: str
     channels: list[ChannelIntensity] = field(default_factory=list)
+    # high-level commands when command-defined (`sub N = ...`); empty if recorded
+    commands: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -103,11 +105,18 @@ class ActiveCue:
 # per-channel provenance, tracked alongside the mixed output so the UI can
 # colour each channel by what is driving it
 SRC_UNDRIVEN = 0  # nothing active touches this channel
-SRC_STORED = 1  # held by an active cue or submaster
+SRC_STORED = 1  # held by an active cue
 SRC_LIVE = 2  # overridden by a live edit
 SRC_DEFAULT = 3  # held at a fixture profile default (base layer)
 SRC_FX = 4  # driven by an effect unit
 SRC_LOOK = 5  # held by an active look bank
+SRC_SUB = 6  # held by an active submaster
+
+# each driver colour maps a DMX grid channel to the panel that explains it
+COLOR_SUB = "#2a6fdb"  # blue -> SUBS pane (`sub`)
+COLOR_LOOK = "#1f9e4a"  # green -> LOOKS pane (`bank`)
+COLOR_FX = "#d08020"  # amber -> FX pane (`fx`)
+COLOR_DEFAULT = "#b8860b"  # gold: held at a fixture profile default (no pane)
 
 
 def apply_ci(
@@ -287,6 +296,12 @@ def format_effect_param(unit: str, param: str, value: Any) -> str:
     return str(round(float(value) * 100))
 
 
+def fmt_level(frac: float) -> str:
+    """Theatrical 2-char level: 00..99 then FL for full (fixed width, no %)."""
+    pct = round(frac * 100)
+    return "FL" if pct >= 100 else f"{pct:02d}"
+
+
 class Engine:
     def __init__(
         self, handler: Callable[[bytes], None], universe_size: int = DMX_UNIVERSE_SIZE
@@ -348,7 +363,7 @@ class Engine:
         for sub in self.subs:
             if sub.intensity > 0:
                 for e in sub.channels:
-                    source[e.channel] = SRC_STORED
+                    source[e.channel] = SRC_SUB
 
         # active look banks snap over cues/subs (LTP overwrite, no HTP merge)
         for channels in self.looks.values():
@@ -749,11 +764,12 @@ class DmxGrid:
 
     _SRC_STYLE = {
         SRC_UNDRIVEN: "fg:#b0b0b0",  # light grey
-        SRC_STORED: "fg:black",
-        SRC_LIVE: "fg:red",
-        SRC_DEFAULT: "fg:#2a6fdb",  # blue: held at a fixture profile default
-        SRC_FX: "fg:#d08020",  # amber: driven by an effect unit
-        SRC_LOOK: "fg:#1f9e4a",  # green: held by an active look bank
+        SRC_STORED: "fg:black",  # held by a cue
+        SRC_LIVE: "fg:red",  # live edit
+        SRC_DEFAULT: f"fg:{COLOR_DEFAULT}",  # gold: held at a fixture profile default
+        SRC_FX: f"fg:{COLOR_FX}",  # amber: driven by an effect unit -> FX pane
+        SRC_LOOK: f"fg:{COLOR_LOOK}",  # green: an active look bank -> LOOKS pane
+        SRC_SUB: f"fg:{COLOR_SUB}",  # yellow: an active submaster -> SUBS pane
     }
 
     def __init__(
@@ -889,7 +905,8 @@ class FxView:
         self.engine = engine
 
     def render(self) -> StyleAndTextTuples:
-        frags: StyleAndTextTuples = [("bold", " FX\n")]
+        # title carries the grid driver colour so amber channels -> this pane
+        frags: StyleAndTextTuples = [(f"bold fg:{COLOR_FX}", " FX\n")]
         effects = self.engine.effects
         if not effects:
             frags.append(("class:dim", " (no effects configured)"))
@@ -899,7 +916,9 @@ class FxView:
             frags.append(("class:dim", f" {unit:<3} "))
             frags.append(("class:dim", f"group={eff.group} "))
             frags.append(
-                ("fg:#d08020", "[active] ") if active else ("class:dim", "[off]   ")
+                (f"fg:{COLOR_FX}", "[active] ")
+                if active
+                else ("class:dim", "[off]   ")
             )
             for param, value in eff.params.items():
                 frags.append(("", f"{param}={format_effect_param(unit, param, value)} "))
@@ -916,16 +935,37 @@ class LooksView:
         self.it = interpreter
 
     def render(self) -> StyleAndTextTuples:
-        frags: StyleAndTextTuples = [("bold", " LOOKS\n")]
+        # title carries the grid driver colour so green channels -> this pane
+        frags: StyleAndTextTuples = [(f"bold fg:{COLOR_LOOK}", " LOOKS\n")]
         if not self.it.banks:
             frags.append(("class:dim", " (no banks configured)"))
             return frags
         for name, bank in self.it.banks.items():
             frags.append(("class:dim", f" {name}: "))
             for look in bank.looks:
-                style = "fg:#1f9e4a bold" if look == bank.active else "class:dim"
+                style = f"fg:{COLOR_LOOK} bold" if look == bank.active else "class:dim"
                 frags.append((style, f"{look} "))
             frags.append(("", "\n"))
+        return frags
+
+
+class SubsView:
+    """Renders each submaster's fader level; non-zero faders highlighted."""
+
+    HEIGHT = 3  # title + wrapped row of faders
+
+    def __init__(self, engine: "Engine") -> None:
+        self.engine = engine
+
+    def render(self) -> StyleAndTextTuples:
+        # title carries the grid driver colour so yellow channels -> this pane
+        frags: StyleAndTextTuples = [(f"bold fg:{COLOR_SUB}", " SUBS\n ")]
+        if not self.engine.subs:
+            frags.append(("class:dim", "(no subs)"))
+            return frags
+        for i, sub in enumerate(self.engine.subs):
+            style = f"fg:{COLOR_SUB} bold" if sub.intensity > 0 else "class:dim"
+            frags.append((style, f"{i + 1}:{fmt_level(sub.intensity)}  "))
         return frags
 
 
@@ -936,6 +976,8 @@ Available commands:
   chan|ch N at|@ LEVEL              set channel N to LEVEL
   chan|ch A thru B at LEVEL         set channels A..B to LEVEL
   sub|submaster N at|@ LEVEL        set submaster N to LEVEL
+  sub N = fix ... ; fix ...         define submaster N from commands
+  sub                               list submaster definitions and levels
   record cue|sub N [fade D]         record current edits as cue/sub N
             [fade_in D] [fade_out D] [hold D]
   midi                              list the wired MIDI bindings
@@ -974,7 +1016,6 @@ Available commands:
   back                              return to the previous cue
   go N                              jump to cue N
   clear                             clear the current edits
-  list                              list all cues, submasters and bindings
   save [path]                       save the show to path (or the --file)
   tickhz N                          set the engine tick rate (Hz)
   view hex|pct [trim|all]           grid value format; trim clips to patched
@@ -1224,18 +1265,18 @@ class Interpreter:
             if eff.group is not None:
                 eff.lanes = self._resolve_lanes(unit, eff.group)
 
-    # ---- look banks -------------------------------------------------------
-    _LOOK_VERBS = {"fix", "fixture", "chan", "ch"}
+    # ---- compiled commands (shared by look banks and command-defined subs) --
+    _COMPILE_VERBS = {"fix", "fixture", "chan", "ch"}
 
-    def _validate_look_commands(self, commands: list[str]) -> None:
+    def _validate_commands(self, commands: list[str]) -> None:
         for c in commands:
             toks = c.split()
             if not toks:
-                raise ValueError("empty look command")
-            if toks[0].lower() not in self._LOOK_VERBS:
-                raise ValueError(f"look commands must be fix/chan only: {c!r}")
+                raise ValueError("empty command")
+            if toks[0].lower() not in self._COMPILE_VERBS:
+                raise ValueError(f"only fix/chan commands allowed: {c!r}")
 
-    async def _compile_look(self, commands: list[str]) -> list[ChannelIntensity]:
+    async def _compile_commands(self, commands: list[str]) -> list[ChannelIntensity]:
         # run the commands capturing the net edits, without touching output
         saved_edits, saved_live = self.engine.edits, self.engine.live_edit
         self.engine.edits, self.engine.live_edit = [], False
@@ -1252,8 +1293,8 @@ class Interpreter:
         commands = [c.strip() for c in commands if c.strip()]
         if not commands:
             raise ValueError("a look needs at least one command")
-        self._validate_look_commands(commands)
-        compiled = await self._compile_look(commands)  # may raise -> not stored
+        self._validate_commands(commands)
+        compiled = await self._compile_commands(commands)  # may raise -> not stored
         b = self.banks.setdefault(bank, Bank(name=bank))
         b.looks[name] = Look(name=name, commands=commands, compiled=compiled)
         if b.active == name:  # refresh output if redefining the live look
@@ -1273,16 +1314,51 @@ class Interpreter:
         b.active = None
         self.engine.looks.pop(bank, None)
 
-    async def _rebind_banks(self) -> None:
-        # fixtures/groups changed: recompile every look's commands to channels
+    async def _rebind_compiled(self) -> None:
+        # fixtures/groups changed: recompile command-defined subs and bank looks
+        for sub in self.engine.subs:
+            if sub.commands:
+                try:
+                    sub.channels = await self._compile_commands(sub.commands)
+                except Exception:
+                    sub.channels = []  # broken after re-patch
         for bank, b in self.banks.items():
             for look in b.looks.values():
                 try:
-                    look.compiled = await self._compile_look(look.commands)
+                    look.compiled = await self._compile_commands(look.commands)
                 except Exception:
                     look.compiled = []  # broken after re-patch -> contributes nothing
             if b.active is not None and b.active in b.looks:
                 self.engine.looks[bank] = b.looks[b.active].compiled
+
+    async def _define_sub(self, num: str, commands: list[str]) -> None:
+        commands = [c.strip() for c in commands if c.strip()]
+        if not commands:
+            raise ValueError("a sub needs at least one command")
+        self._validate_commands(commands)
+        channels = await self._compile_commands(commands)  # may raise -> not stored
+        cn = parse_user_index(num, self.engine.subs, extend=True)
+        # preserve the fader of an existing sub so redefining a live one stays up
+        keep = self.engine.subs[cn].intensity if cn < len(self.engine.subs) else 0.0
+        sub = Submaster(
+            intensity=keep, name="", channels=channels, commands=commands
+        )
+        if cn == len(self.engine.subs):
+            self.engine.subs.append(sub)
+        else:
+            self.engine.subs[cn] = sub
+
+    def _list_subs(self) -> None:
+        if not self.engine.subs:
+            print("No subs")
+            return
+        for i, s in enumerate(self.engine.subs):
+            defn = (
+                " ; ".join(s.commands)
+                if s.commands
+                else f"{len(s.channels)} channels (recorded)"
+            )
+            print(f"sub {i + 1} [{fmt_level(s.intensity)}]: {defn}")
 
     def _list_banks(self) -> None:
         if not self.banks:
@@ -1581,9 +1657,12 @@ class Interpreter:
                 lines.append(f"bank {bank} {b.active}")
         # submasters next, so later `sub N at`/`midi bind` lines resolve
         for i, sub in enumerate(self.engine.subs):
-            for ci in sub.channels:
-                lines.append(f"chan {ci.channel + 1} at 0x{ci.intensity:02X}")
-            lines.append(f"record sub {i + 1}")
+            if sub.commands:  # command-defined: persist as high-level commands
+                lines.append(f"sub {i + 1} = {' ; '.join(sub.commands)}")
+            else:  # recorded from edits: persist the channel snapshot
+                for ci in sub.channels:
+                    lines.append(f"chan {ci.channel + 1} at 0x{ci.intensity:02X}")
+                lines.append(f"record sub {i + 1}")
             if sub.intensity > 0:
                 lines.append(f"sub {i + 1} at 0x{round(sub.intensity * 255):02X}")
         for i, cue in enumerate(self.engine.cues):
@@ -1631,6 +1710,12 @@ class Interpreter:
                     self.engine.add_edit(
                         ChannelIntensity(channel=i - 1, intensity=intensity)
                     )
+            case ["sub" | "submaster"]:
+                self._list_subs()
+            case ["sub" | "submaster", num, "=", *_rest]:
+                # define a sub from high-level commands (original case + ';')
+                body = cmd.split("=", 1)[1]
+                await self._define_sub(num, body.split(";"))
             case ["sub" | "submaster", chan, ("at" | "@"), level]:
                 intensity = parse_intensity(level)
                 cn = parse_user_index(chan, self.engine.subs, extend=False)
@@ -1673,7 +1758,7 @@ class Interpreter:
                 self.note_bindings.pop(parse_chan_num(notenum), None)
             case ["patch", profile, label, *rest]:
                 self._patch(profile, label, rest)
-                await self._rebind_banks()  # looks may reference new fixtures
+                await self._rebind_compiled()  # subs/looks may reference new fixtures
             case ["group"]:
                 self._list_groups()
             case ["group", name, *sel]:
@@ -1684,7 +1769,7 @@ class Interpreter:
                     raise ValueError(f"unknown fixtures in group: {remainder}")
                 self.groups[name] = [(fx.label, fx.number) for fx in fixtures]
                 self._rebind_effects()  # group membership may have changed
-                await self._rebind_banks()  # look selectors may have changed
+                await self._rebind_compiled()  # sub/look selectors may have changed
             case ["bank"]:
                 self._list_banks()
             case ["bank", _bankname, *_rest]:
@@ -1789,27 +1874,6 @@ class Interpreter:
                 raise ValueError("NYI")
             case ["clear"]:
                 await self.engine.clear_edits()
-            case ["list"]:
-                if self.engine.cues:
-                    for idx, cue in enumerate(self.engine.cues):
-                        print(f"cue {idx + 1:03} {cue}")
-                else:
-                    print("No cues")
-                if self.engine.subs:
-                    for idx, sub in enumerate(self.engine.subs):
-                        print(f"sub {idx + 1:03} {sub}")
-                else:
-                    print("No submasters")
-                for fx in self.fixtures.values():
-                    print(
-                        f"fixture {fx.label} {fx.number} "
-                        f"({fx.kind}) @ {fx.base + 1}"
-                    )
-                self._list_groups()
-                self._list_effects()
-                if self.banks:
-                    self._list_banks()
-                self._list_bindings()
             case ["save"] | ["save", _]:
                 # match lowercased the line, so recover the path from the
                 # original cmd to keep case-sensitive paths intact
@@ -1883,6 +1947,7 @@ async def main(
     midi_view = MidiView(midi)
     fx_view = FxView(engine)
     looks_view = LooksView(interpreter)
+    subs_view = SubsView(engine)
 
     history = FileHistory(os.path.expanduser("~/.aioartnet-console-history"))
 
@@ -1950,6 +2015,13 @@ async def main(
                 height=LooksView.HEIGHT,
                 wrap_lines=True,
                 style="class:looks",
+            ),
+            Window(height=1, char="─", style="class:sep"),
+            Window(
+                content=FormattedTextControl(subs_view.render),
+                height=SubsView.HEIGHT,
+                wrap_lines=True,
+                style="class:subs",
             ),
             Window(height=1, char="─", style="class:sep"),
             Window(
