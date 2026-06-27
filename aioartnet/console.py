@@ -159,7 +159,7 @@ PT_PARAMS: dict[str, tuple] = {
 EFFECT_PARAMS: dict[str, dict[str, tuple]] = {"rgb": RGB_PARAMS, "pt": PT_PARAMS}
 
 SPEED_MAX_HZ = 1.0  # animation rate at speed = 100%
-PT_AMP_MAX = 127  # pan/tilt delta in DMX steps at size = 100%
+PT_AMP_MAX = 127  # half coarse-range; *256 gives the 16-bit movement amplitude
 
 
 @dataclass
@@ -230,20 +230,32 @@ class PtEffect(Effect):
             return
         speed = float(self.params["speed"]) * SPEED_MAX_HZ
         spread = float(self.params["spread"])
-        amp = float(self.params["size"]) * PT_AMP_MAX * float(self.params["intensity"])
+        # the home/rest position is an 8-bit coarse value; the movement is
+        # computed in 16-bit so it stays smooth and feeds pan_fine/tilt_fine
+        amp16 = (
+            float(self.params["size"])
+            * float(self.params["intensity"])
+            * PT_AMP_MAX
+            * 256
+        )
         shape = self._SHAPES[self.params["mode"]]
         for lane in self.lanes:
             theta = 2 * math.pi * (speed * t + (lane.index / n) * spread)
             dpan, dtilt = shape(theta)
-            for role, home, delta in (
-                ("pan", lane.home[0], dpan),
-                ("tilt", lane.home[1], dtilt),
+            for coarse, fine, home, delta in (
+                ("pan", "pan_fine", lane.home[0], dpan),
+                ("tilt", "tilt_fine", lane.home[1], dtilt),
             ):
-                ch = lane.channels.get(role)
+                ch = lane.channels.get(coarse)
                 if ch is None:
                     continue
-                live[ch] = max(0, min(255, home + round(amp * delta)))
+                pos = max(0, min(65535, (home << 8) + round(amp16 * delta)))
+                live[ch] = pos >> 8
                 source[ch] = SRC_FX
+                fch = lane.channels.get(fine)
+                if fch is not None:
+                    live[fch] = pos & 0xFF
+                    source[fch] = SRC_FX
 
 
 EFFECT_CLASSES: dict[str, type[Effect]] = {"rgb": RgbEffect, "pt": PtEffect}
@@ -1079,7 +1091,12 @@ class Interpreter:
         return (defaults.get("pan", 128), defaults.get("tilt", 128))
 
     def _resolve_lanes(self, unit: str, group: str) -> list[EffectLane]:
-        roles = ("red", "green", "blue") if unit == "rgb" else ("pan", "tilt")
+        roles = (
+            ("red", "green", "blue")
+            if unit == "rgb"
+            # fine channels are optional; used for 16-bit movement when present
+            else ("pan", "tilt", "pan_fine", "tilt_fine")
+        )
         lanes: list[EffectLane] = []
         for label, number in self.groups.get(group, []):
             fx = self._fixture(label, number)

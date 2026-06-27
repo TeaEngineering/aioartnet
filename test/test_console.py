@@ -781,3 +781,75 @@ async def test_fixture_attr_listing(capsys) -> None:  # type: ignore[no-untyped-
     assert "red" in out and "green" in out and "blue" in out
     assert "gobo" not in out  # head-only attr excluded from the common set
     assert "white" not in out and "amber" not in out
+
+
+@pytest.mark.asyncio
+async def test_fx_pt_16bit_fine_channels() -> None:
+    from aioartnet.console import load_profiles
+
+    # a head with pan_fine/tilt_fine: pan@0 pan_fine@1 tilt@2 tilt_fine@3
+    profiles = load_profiles(
+        {"fixtures": {"mh": ["pan", "pan_fine", "tilt", "tilt_fine", "dimmer"]}}
+    )
+    engine = Engine(Mock(), universe_size=20)
+    it = Interpreter(engine, profiles=profiles)
+    await it.on_cmd("patch mh m 1 @ 1")
+    await it.on_cmd("group g = m 1")
+    await it.on_cmd("fx pt group g")
+    await it.on_cmd("fx pt home 100 100")
+    await it.on_cmd("fx pt mode circle")
+    await it.on_cmd("fx pt size 50")  # amp16 = 0.5*127*256 = 16256
+    await it.on_cmd("fx pt speed 0")
+    await it.on_cmd("fx pt intensity 100")
+    await engine.poll(0.0)  # theta 0 -> dpan=1, dtilt=0
+
+    live = _captured(engine)
+    # pan: (100<<8) + 16256 = 41856 -> coarse 163, fine 128
+    assert (live[0], live[1]) == (163, 128)
+    # tilt: delta 0 -> 100<<8 -> coarse 100, fine 0
+    assert (live[2], live[3]) == (100, 0)
+
+    # static holds the coarse home exactly with fine zeroed
+    await it.on_cmd("fx pt mode static")
+    await engine.poll(0.0)
+    live = _captured(engine)
+    assert (live[0], live[1], live[2], live[3]) == (100, 0, 100, 0)
+
+
+@pytest.mark.asyncio
+async def test_fixture_inspect_detail(capsys) -> None:  # type: ignore[no-untyped-def]
+    engine = Engine(Mock(), universe_size=120)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    # star_wash_bl footprint 8: pan0 tilt1 dimmer2 red3 green4 blue5 white6 gobo7
+    await it.on_cmd("patch star_wash_bl head 1 thru 2 @ 1")  # head2 base 8
+    await it.on_cmd("live on")
+    await it.on_cmd("fix head 2 red 50")  # parse_intensity(50)=128
+    await it.on_cmd("fix head 2 gobo stars")  # value 50
+    await engine.poll(0.0)
+
+    capsys.readouterr()  # clear
+    await it.on_cmd("fixture head 2")
+    out = capsys.readouterr().out
+
+    assert "head 2 (star_wash_bl) @ 9" in out  # base 8 -> abs address 9
+    lines = {ln.split()[0]: ln for ln in out.splitlines() if ln.startswith("  ")}
+    # red: rel 4 (offset 3), abs 12 (base 8 + offset 3 = 11 -> +1), value 128
+    assert "rel  4" in lines["red"] and "abs  12" in lines["red"]
+    assert lines["red"].rstrip().endswith("= 128")
+    # gobo enum shows the matching macro name for its current value
+    assert "stars" in lines["gobo"]
+
+
+@pytest.mark.asyncio
+async def test_fixture_inspect_vs_group_summary(capsys) -> None:  # type: ignore[no-untyped-def]
+    engine = Engine(Mock(), universe_size=120)
+    it = Interpreter(engine, profiles=_fixture_profiles())
+    await it.on_cmd("patch star_wash_bl head 1 thru 2 @ 1")
+    await it.on_cmd("group heads = head 1 thru 2")
+
+    await it.on_cmd("fixture head 1")  # single -> detail (has abs/rel/value)
+    assert "abs" in capsys.readouterr().out
+
+    await it.on_cmd("fixture heads")  # multiple -> common attrs summary
+    out = capsys.readouterr().out
+    assert "settable attributes" in out and "abs" not in out
