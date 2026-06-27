@@ -1781,7 +1781,11 @@ class Interpreter:
             case ["fix" | "fixture"]:
                 if self.fixtures:
                     for fx in self.fixtures.values():
-                        print(f"{fx.label} {fx.number} ({fx.kind}) @ {fx.base + 1}")
+                        end = fx.base + fx.profile.footprint
+                        print(
+                            f"{fx.label} {fx.number} ({fx.kind}) "
+                            f"@ {fx.base + 1} - {end}"
+                        )
                 else:
                     print("No fixtures patched")
             case ["fix" | "fixture", *rest]:
