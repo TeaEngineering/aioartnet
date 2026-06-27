@@ -678,9 +678,13 @@ class DmxGrid:
         self.source_map = source_map
         self.label = label
         self.mode = "hex"  # "hex" or "pct"
+        self.trim = False  # clip the grid to the highest patched channel
+        # returns the channel count to show when trimmed (0 = nothing patched)
+        self.trim_source: Optional[Callable[[], int]] = None
         self._last_data: bytes = b""
         self._last_src: bytes = b""
         self._cache_mode: Optional[str] = None
+        self._cache_vis = -1
         self._cache: StyleAndTextTuples = []
         self._text: dict[str, list[str]] = {
             "hex": [self._cell_text(v, "hex") for v in range(256)],
@@ -702,31 +706,45 @@ class DmxGrid:
         return text + " "
 
     @property
+    def visible_channels(self) -> int:
+        """Channels to render: all of them, or rounded up to a full row of the
+        highest patched channel when trimmed (at least one row)."""
+        if not self.trim or self.trim_source is None:
+            return DMX_UNIVERSE_SIZE
+        extent = self.trim_source()
+        rows = max(1, (extent + self.COLS - 1) // self.COLS)
+        return min(DMX_UNIVERSE_SIZE, rows * self.COLS)
+
+    @property
     def height(self) -> int:
-        rows = (DMX_UNIVERSE_SIZE + self.COLS - 1) // self.COLS
+        rows = (self.visible_channels + self.COLS - 1) // self.COLS
         return rows + 2  # title line + column header
 
     def render(self) -> StyleAndTextTuples:
         data = self.source()
         src = self.source_map() if self.source_map is not None else b""
+        vis = self.visible_channels
         if (
             bytes(data) == self._last_data
             and bytes(src) == self._last_src
             and self._cache_mode == self.mode
+            and self._cache_vis == vis
         ):
             return self._cache
         self._last_data = bytes(data)
         self._last_src = bytes(src)
         self._cache_mode = self.mode
+        self._cache_vis = vis
         text = self._text[self.mode]
 
+        tag = f"{self.mode}, trim" if self.trim else self.mode
         frags: StyleAndTextTuples = [
-            ("bold", f" DMX {self.label}  [{self.mode}]\n"),
+            ("bold", f" DMX {self.label}  [{tag}]\n"),
             ("class:dim", "     "),
         ]
         for c in range(self.COLS):
             frags.append(("class:dim", f"{c + 1:>2} "))
-        for ch in range(len(data)):
+        for ch in range(vis):
             if ch % self.COLS == 0:
                 frags.append(("class:dim", f"\n{ch + 1:>4} "))
             code = src[ch] if ch < len(src) else SRC_UNDRIVEN
@@ -835,7 +853,7 @@ Available commands:
   list                              list all cues, submasters and bindings
   save [path]                       save the show to path (or the --file)
   tickhz N                          set the engine tick rate (Hz)
-  view hex|pct                      switch the DMX grid value format
+  view hex|pct [trim|all]           grid value format; trim clips to patched
 LEVEL may be a percentage (0-100), a hex value (0xFF), or F/FULL, H/HALF, Z/ZERO."""
 
 
@@ -958,6 +976,28 @@ class Interpreter:
             eff = EFFECT_CLASSES[unit]()
             self.engine.effects[unit] = eff
         return eff
+
+    def _patched_extent(self) -> int:
+        # highest patched channel (1-based count), for trimming the DMX grid
+        return max(
+            (fx.base + fx.profile.footprint for fx in self.fixtures.values()),
+            default=0,
+        )
+
+    def _set_view(self, opts: list[str]) -> None:
+        if self.grid is None:
+            return
+        for opt in opts:
+            if opt == "hex":
+                self.grid.mode = "hex"
+            elif opt in ("pct", "percent", "fl"):
+                self.grid.mode = "pct"
+            elif opt == "trim":
+                self.grid.trim = True
+            elif opt == "all":
+                self.grid.trim = False
+            else:
+                raise ValueError(f"unknown view option {opt!r}")
 
     def _default_home(self, fx: PatchedFixture) -> tuple[int, int]:
         defaults = fx.profile.defaults
@@ -1202,6 +1242,9 @@ class Interpreter:
                 lines.append(
                     f"midi bind note {note} fx {tgt[1]} {tgt[2]} {tgt[3]}"
                 )
+        # display preference (only when non-default, to keep the file clean)
+        if self.grid is not None and (self.grid.trim or self.grid.mode != "hex"):
+            lines.append(f"view {self.grid.mode} {'trim' if self.grid.trim else 'all'}")
         return lines
 
     async def on_cmd(self, cmd: str) -> str:
@@ -1409,9 +1452,8 @@ class Interpreter:
                 print(f"saved to {path}")
             case ["tickhz", hz]:
                 self.engine.tickhz = int(hz)
-            case ["view", ("hex" | "pct" | "percent" | "fl") as fmt]:
-                if self.grid is not None:
-                    self.grid.mode = "hex" if fmt == "hex" else "pct"
+            case ["view", *opts]:
+                self._set_view(opts)
             case ["help" | "h" | "?"]:
                 print(HELP_TEXT)
             case _:
@@ -1460,6 +1502,7 @@ async def main(
     midi: Optional[MidiCC] = None,
 ) -> None:
     grid = DmxGrid(dmx_source, lambda: bytes(engine.last_source), label)
+    grid.trim_source = interpreter._patched_extent
     interpreter.grid = grid
     midi_view = MidiView(midi)
     fx_view = FxView(engine)
@@ -1504,7 +1547,8 @@ async def main(
         [
             Window(
                 content=FormattedTextControl(grid.render),
-                height=grid.height,
+                # dynamic: shrinks when the grid is trimmed to patched channels
+                height=lambda: grid.height,
                 style="class:grid",
             ),
             Window(height=1, char="─", style="class:sep"),
