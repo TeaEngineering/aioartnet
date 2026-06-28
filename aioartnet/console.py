@@ -526,6 +526,11 @@ class MidiCC:
         self.note_listeners: dict[MidiKey, list[Callable[[bool], None]]] = (
             defaultdict(list)
         )
+        # note-value listeners get the live pressure: velocity on press, poly
+        # aftertouch while held, 0 on release (for continuous "touch" bindings)
+        self.note_value_listeners: dict[MidiKey, list[Callable[[int], None]]] = (
+            defaultdict(list)
+        )
         # priority CC handlers (UI editing, e.g. positioning): each may consume a
         # CC by returning True, which suppresses the general listeners for it
         self.cc_priority: list[Callable[[MidiKey, int], bool]] = []
@@ -533,6 +538,10 @@ class MidiCC:
     def _fire_note(self, key: MidiKey, pressed: bool) -> None:
         for listener in self.note_listeners.get(key, []):
             listener(pressed)
+
+    def _fire_note_value(self, key: MidiKey, value: int) -> None:
+        for listener in self.note_value_listeners.get(key, []):
+            listener(value)
 
     def poll(self) -> None:
         # drain every queued message (get_message() returns None when empty)
@@ -552,17 +561,23 @@ class MidiCC:
                 if vel == 0:  # note-on velocity 0 is conventionally a note-off
                     if self.notes_on.pop(key, None) is not None:
                         self._fire_note(key, False)
+                        self._fire_note_value(key, 0)
                 elif key not in self.notes_on:  # only fire on the press edge
                     self.notes_on[key] = vel
                     self._fire_note(key, True)
-                else:
+                    self._fire_note_value(key, vel)
+                else:  # re-trigger while held: update the live value only
                     self.notes_on[key] = vel
+                    self._fire_note_value(key, vel)
             elif status == NOTE_OFF:
                 key = (chan, message[1])
                 if self.notes_on.pop(key, None) is not None:
                     self._fire_note(key, False)
+                    self._fire_note_value(key, 0)
             elif status == POLY_AFTERTOUCH:
-                self.notes_on[(chan, message[1])] = message[2]
+                key = (chan, message[1])
+                self.notes_on[key] = message[2]
+                self._fire_note_value(key, message[2])
             # CHANNEL_AFTERTOUCH / PROGRAM_CHANGE / clock / etc. are ignored
 
         # dispatch CC changes seen this tick: priority (UI) handlers first; if
@@ -580,6 +595,9 @@ class MidiCC:
 
     def bind_note(self, key: MidiKey, listener: Callable[[bool], None]) -> None:
         self.note_listeners[key].append(listener)
+
+    def bind_note_value(self, key: MidiKey, listener: Callable[[int], None]) -> None:
+        self.note_value_listeners[key].append(listener)
 
     async def run(self, interval: float = 0.01) -> None:
         while True:
@@ -1073,6 +1091,7 @@ Available commands:
   midi bind cc C sub N              bind MIDI CC C to submaster N
   midi bind cc C                    unbind MIDI CC C
   midi bind note K flash sub N      pad K flashes submaster N while held
+  midi bind note K touch sub N      pad K pressure sets submaster N level
   midi bind note K                  unbind pad K
             C and K are 'ch:num' (e.g. 9:36); a bare num means channel 0
   patch PROFILE LBL N [thru M] @ A  patch fixture(s) of PROFILE at address A
@@ -1793,6 +1812,8 @@ class Interpreter:
         for key, tgt in sorted(self.note_bindings.items(), key=lambda kv: kv[0]):
             if tgt[0] == "flash":
                 dst = f"flash sub {tgt[1] + 1}"
+            elif tgt[0] == "touch":
+                dst = f"touch sub {tgt[1] + 1}"
             elif tgt[0] == "bank":
                 dst = f"bank {tgt[1]} {tgt[2]}"
             else:
@@ -1868,6 +1889,7 @@ class Interpreter:
     def _wire_note(self, key: MidiKey) -> None:
         if self.midi is not None and key not in self._wired_notes:
             self.midi.bind_note(key, self._note_listener(key))
+            self.midi.bind_note_value(key, self._note_value_listener(key))
             self._wired_notes.add(key)
 
     def _note_event(self, key: MidiKey, pressed: bool) -> None:
@@ -1901,6 +1923,19 @@ class Interpreter:
 
     def _note_listener(self, key: MidiKey) -> Callable[[bool], None]:
         return lambda pressed: self._note_event(key, pressed)
+
+    def _note_value_event(self, key: MidiKey, value: int) -> None:
+        # continuous pressure -> submaster level (velocity, aftertouch, 0 on
+        # release); reads note_bindings dynamically like _note_event
+        tgt = self.note_bindings.get(key)
+        if tgt is None or tgt[0] != "touch":
+            return
+        idx = tgt[1]
+        if 0 <= idx < len(self.engine.subs):
+            self.engine.subs[idx].intensity = value / 127.0
+
+    def _note_value_listener(self, key: MidiKey) -> Callable[[int], None]:
+        return lambda value: self._note_value_event(key, value)
 
     @staticmethod
     def _compact_refs(refs: list[tuple[str, int]]) -> str:
@@ -1969,6 +2004,8 @@ class Interpreter:
             note = fmt_chan_num(key)
             if tgt[0] == "flash":
                 lines.append(f"midi bind note {note} flash sub {tgt[1] + 1}")
+            elif tgt[0] == "touch":
+                lines.append(f"midi bind note {note} touch sub {tgt[1] + 1}")
             elif tgt[0] == "bank":
                 lines.append(f"midi bind note {note} bank {tgt[1]} {tgt[2]}")
             else:
@@ -2038,6 +2075,11 @@ class Interpreter:
                 key = parse_chan_num(notenum)
                 idx = parse_user_index(subnum, self.engine.subs, extend=False)
                 self.note_bindings[key] = ("flash", idx)
+                self._wire_note(key)
+            case ["midi", "bind", "note", notenum, "touch", "sub", subnum]:
+                key = parse_chan_num(notenum)
+                idx = parse_user_index(subnum, self.engine.subs, extend=False)
+                self.note_bindings[key] = ("touch", idx)
                 self._wire_note(key)
             case ["midi", "bind", "note", notenum, "fx", unit, param, value]:
                 key = parse_chan_num(notenum)

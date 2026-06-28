@@ -1427,3 +1427,40 @@ async def test_position_focus_single_fixture() -> None:
     it._nudge("pan", 1, fine=False)  # both move again
     assert it.positioning.pan[h1] == 3 * POS_COARSE
     assert it.positioning.pan[h2] == 2 * POS_COARSE
+
+
+@pytest.mark.asyncio
+async def test_midi_note_touch_drives_submaster() -> None:
+    from aioartnet.console import NOTE_OFF, NOTE_ON, POLY_AFTERTOUCH, MidiCC
+
+    engine = Engine(Mock(), universe_size=20)
+    fake = _FakeMidiIn()
+    midi = MidiCC(fake)
+    it = Interpreter(engine, midi=midi)
+    await it.on_cmd("chan 1 at f")
+    await it.on_cmd("record sub 1")
+    await it.on_cmd("midi bind note 9:40 touch sub 1")
+    assert it.note_bindings == {(9, 40): ("touch", 0)}
+    sub = engine.subs[0]
+
+    # press velocity sets the level
+    fake.feed([NOTE_ON | 9, 40, 64])
+    midi.poll()
+    assert sub.intensity == 64 / 127.0
+    # poly aftertouch tracks the pressure live while held
+    fake.feed([POLY_AFTERTOUCH | 9, 40, 127])
+    midi.poll()
+    assert sub.intensity == 1.0
+    fake.feed([POLY_AFTERTOUCH | 9, 40, 20])
+    midi.poll()
+    assert sub.intensity == 20 / 127.0
+    # release drops it to zero
+    fake.feed([NOTE_OFF | 9, 40, 0])
+    midi.poll()
+    assert sub.intensity == 0.0
+    # a different pad's aftertouch must not affect this sub (per-note keyed)
+    fake.feed([NOTE_ON | 9, 40, 100], [POLY_AFTERTOUCH | 9, 41, 5])
+    midi.poll()
+    assert sub.intensity == 100 / 127.0
+    # round-trips through save
+    assert "midi bind note 9:40 touch sub 1" in it.serialise()
