@@ -1373,3 +1373,47 @@ async def test_position_cc_persists_and_inhibits() -> None:
     midi.poll()
     assert it.positioning.tilt[("head", 1)] == round(100 / 127 * 65535)  # type: ignore[union-attr]
     assert "position cc 0:70 0:71" in it.serialise()
+
+
+@pytest.mark.asyncio
+async def test_position_focus_single_fixture() -> None:
+    from aioartnet.console import POS_COARSE
+
+    engine = Engine(Mock(), universe_size=40)
+    it = Interpreter(engine, profiles=_pt_profiles())
+    await it.on_cmd("patch head head 1 thru 2 @ 1")  # base 0 and 5
+    await it.on_cmd("group heads = head 1 thru 2")
+    await it.on_cmd("position heads")
+    assert it.positioning is not None and it.positioning.focus is None
+
+    h1, h2 = ("head", 1), ("head", 2)
+
+    # all (focus None): nudge moves both
+    it._nudge("pan", 1, fine=False)
+    assert it.positioning.pan[h1] == POS_COARSE
+    assert it.positioning.pan[h2] == POS_COARSE
+
+    # n -> focus head 1: nudge moves only head 1
+    it._focus_next(1)
+    assert it.positioning.focus == 0
+    it._nudge("pan", 1, fine=False)
+    assert it.positioning.pan[h1] == 2 * POS_COARSE
+    assert it.positioning.pan[h2] == POS_COARSE  # unchanged
+
+    # n -> focus head 2: nudge moves only head 2
+    it._focus_next(1)
+    assert it.positioning.focus == 1
+    it._nudge("tilt", 1, fine=False)
+    assert it.positioning.tilt[h2] == POS_COARSE
+    assert it.positioning.tilt[h1] == 0  # unchanged
+
+    # n wraps back to head 1; p wraps the other way; a returns to all
+    it._focus_next(1)
+    assert it.positioning.focus == 0
+    it._focus_next(-1)
+    assert it.positioning.focus == 1
+    it._focus_all()
+    assert it.positioning.focus is None
+    it._nudge("pan", 1, fine=False)  # both move again
+    assert it.positioning.pan[h1] == 3 * POS_COARSE
+    assert it.positioning.pan[h2] == 2 * POS_COARSE

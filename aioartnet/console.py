@@ -84,6 +84,7 @@ class Positioning:
     pan: dict[tuple[str, int], int]  # (label, number) -> 0..65535
     tilt: dict[tuple[str, int], int]
     driving: bool = True
+    focus: Optional[int] = None  # index into targets being edited; None = all
 
 
 @dataclass
@@ -1040,13 +1041,17 @@ class PositionView:
                     f"   CC pan={fmt_chan_num(pan_cc)}, tilt={fmt_chan_num(tilt_cc)}",
                 )
             )
+        if len(pos.targets) > 1:
+            frags.append(("class:dim", "   n/p/a focus"))
         frags.append(("", "\n"))
-        for ref in pos.targets:
+        for idx, ref in enumerate(pos.targets):
             label, number = ref
+            edited = pos.focus is None or pos.focus == idx
+            marker = ">" if pos.focus == idx else " "
             frags.append(
                 (
-                    "fg:#c060ff" if pos.driving else "class:dim",
-                    f" {label} {number}  pan 0x{pos.pan[ref]:04X}"
+                    "fg:#c060ff" if (pos.driving and edited) else "class:dim",
+                    f"{marker}{label} {number}  pan 0x{pos.pan[ref]:04X}"
                     f"  tilt 0x{pos.tilt[ref]:04X}\n",
                 )
             )
@@ -1097,6 +1102,7 @@ Available commands:
   bank B off                        deactivate bank B
   midi bind note K bank B L         pad K activates look L in bank B
   position SELECTOR                 aim fixtures (arrows jog, shift=fine, esc releases)
+            while driving: n/p/a focus next/prev/all fixture
   position drive                    resume cursor driving after esc
   position cc PANCC TILTCC          also drive pan/tilt from two CC knobs
   position store BANK LOOK          write the aim into a look (per-fixture)
@@ -1544,23 +1550,46 @@ class Interpreter:
                         ChannelIntensity(fx.base + fo, val16 & 0xFF)
                     )
 
+    def _edited_refs(self) -> list[tuple[str, int]]:
+        # the fixtures the cursor/CC edits affect: the focused one, or all
+        pos = self.positioning
+        if pos is None:
+            return []
+        if pos.focus is None:
+            return list(pos.targets)
+        return [pos.targets[pos.focus]]
+
+    def _focus_next(self, step: int) -> None:
+        pos = self.positioning
+        if pos is None or len(pos.targets) < 2:
+            return
+        n = len(pos.targets)
+        if pos.focus is None:
+            pos.focus = 0 if step > 0 else n - 1
+        else:
+            pos.focus = (pos.focus + step) % n
+
+    def _focus_all(self) -> None:
+        if self.positioning is not None:
+            self.positioning.focus = None
+
     def _nudge(self, axis: str, direction: int, fine: bool) -> None:
         pos = self.positioning
         if pos is None:
             return
         step = POS_FINE if fine else POS_COARSE
         working = pos.pan if axis == "pan" else pos.tilt
-        for ref in pos.targets:
+        for ref in self._edited_refs():
             working[ref] = max(0, min(65535, working[ref] + direction * step))
         self._apply_position()
 
     def _set_axis16(self, axis: str, val16: int) -> None:
-        # used by the positioning CC listeners (drives all targets together)
+        # used by the positioning CC handler (drives the focused fixture, or all)
         pos = self.positioning
         if pos is None:
             return
         working = pos.pan if axis == "pan" else pos.tilt
-        for ref in pos.targets:
+        for ref in self._edited_refs():
             working[ref] = max(0, min(65535, val16))
         self._apply_position()
 
@@ -2384,6 +2413,22 @@ async def main(
         ("s-down", "tilt", -1, True),
     ):
         kb.add(keyname, filter=driving)(_jog(axis, direction, fine))
+
+    # n/p/a focus next/previous/all fixture within the driven group
+    @kb.add("n", filter=driving)
+    def _focus_next_key(event: Any) -> None:
+        interpreter._focus_next(1)
+        event.app.invalidate()
+
+    @kb.add("p", filter=driving)
+    def _focus_prev_key(event: Any) -> None:
+        interpreter._focus_next(-1)
+        event.app.invalidate()
+
+    @kb.add("a", filter=driving)
+    def _focus_all_key(event: Any) -> None:
+        interpreter._focus_all()
+        event.app.invalidate()
 
     @kb.add("escape", filter=has_position, eager=True)
     def _esc_position(event: Any) -> None:
