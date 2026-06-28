@@ -881,10 +881,12 @@ async def test_look_bank_no_htp_bleed() -> None:
     assert it.banks["heads"].active == "grn_star"
     assert list(engine.looks.keys()) == ["heads"]  # one entry: mutex
 
-    # deactivate clears the bank
+    # an empty look is the neutral/off state: it replaces the active look and
+    # drives nothing, so the gobo falls back off the look layer
+    await it.on_cmd("bank heads off = ")
     await it.on_cmd("bank heads off")
     await engine.poll(0.0)
-    assert "heads" not in engine.looks
+    assert it.banks["heads"].active == "off"
     assert engine.last_source[7] != SRC_LOOK
 
 
@@ -930,19 +932,27 @@ async def test_look_bank_validation() -> None:
     await it.on_cmd("patch star_wash_bl head 1 @ 1")
     await it.on_cmd("group heads = head 1")
 
-    with pytest.raises(ValueError):
-        await it.on_cmd("bank heads bad = record cue 1")  # not a fix/chan command
-    with pytest.raises(ValueError):
-        await it.on_cmd("bank heads empty = ")  # empty body
-    with pytest.raises(ValueError):
-        await it.on_cmd("bank heads off = fix heads gobo open")  # 'off' reserved
-    assert "heads" not in it.banks  # nothing stored on failure
+    from aioartnet.console import SRC_LOOK
 
-    # 'bank B off' still deactivates cleanly
-    await it.on_cmd("bank heads a = fix heads gobo moon")
-    await it.on_cmd("bank heads a")
+    # a non-fix/chan command is still rejected, and nothing is stored on failure
+    with pytest.raises(ValueError):
+        await it.on_cmd("bank heads bad = record cue 1")
+    assert "heads" not in it.banks
+
+    # empty looks are allowed and may be named anything ('off', 'open', ...);
+    # there is no reserved/synthetic name
+    await it.on_cmd("bank heads off = ")  # empty body -> neutral look
+    assert it.banks["heads"].looks["off"].commands == []
+    await it.on_cmd("bank heads open = fix heads gobo open")
+
+    # activating the empty look replaces whatever was live, driving nothing
+    await it.on_cmd("bank heads open")
+    await engine.poll(0.0)
+    assert it.banks["heads"].active == "open"
     await it.on_cmd("bank heads off")
-    assert it.banks["heads"].active is None
+    await engine.poll(0.0)
+    assert it.banks["heads"].active == "off"
+    assert engine.last_source[7] != SRC_LOOK  # gobo no longer look-driven
 
 
 @pytest.mark.asyncio

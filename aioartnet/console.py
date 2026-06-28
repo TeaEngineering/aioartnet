@@ -1098,8 +1098,7 @@ Available commands:
   midi bind note K fx UNIT PARAM V  pad K sets an effect param (e.g. style)
   bank                              list look banks
   bank B [L]                        list a bank (or activate look L, snap)
-  bank B L = fix ... ; fix ...      define a look (fix/chan commands)
-  bank B off                        deactivate bank B
+  bank B L = fix ... ; fix ...      define a look (empty body = neutral look)
   midi bind note K bank B L         pad K activates look L in bank B
   position SELECTOR                 aim fixtures (arrows jog, shift=fine, esc releases)
             while driving: n/p/a focus next/prev/all fixture
@@ -1391,11 +1390,9 @@ class Interpreter:
             self.engine.edits, self.engine.live_edit = saved_edits, saved_live
 
     async def _define_look(self, bank: str, name: str, commands: list[str]) -> None:
-        if name == "off":
-            raise ValueError("'off' is reserved (use 'bank B off' to clear)")
+        # an empty look (no commands) is allowed: it drives nothing, so it is a
+        # neutral state the user can name as they please ("off", "open", ...)
         commands = [c.strip() for c in commands if c.strip()]
-        if not commands:
-            raise ValueError("a look needs at least one command")
         self._validate_commands(commands)
         compiled = await self._compile_commands(commands)  # may raise -> not stored
         b = self.banks.setdefault(bank, Bank(name=bank))
@@ -1409,13 +1406,6 @@ class Interpreter:
             raise ValueError(f"no look {name!r} in bank {bank!r}")
         b.active = name  # mutex: one active look per bank
         self.engine.looks[bank] = b.looks[name].compiled
-
-    def _deactivate_bank(self, bank: str) -> None:
-        b = self.banks.get(bank)
-        if b is None:
-            raise ValueError(f"no bank {bank!r}")
-        b.active = None
-        self.engine.looks.pop(bank, None)
 
     async def _rebind_compiled(self) -> None:
         # fixtures/groups changed: recompile command-defined subs and bank looks
@@ -1497,8 +1487,6 @@ class Interpreter:
                 raise ValueError("usage: bank B L = <cmd> ; <cmd> ...")
             body = " ".join(rest[2:])
             await self._define_look(bank, rest[0].lower(), body.split(";"))
-        elif len(rest) == 1 and rest[0].lower() == "off":  # bank B off
-            self._deactivate_bank(bank)
         elif len(rest) == 1:  # bank B L -> activate
             self._activate_look(bank, rest[0].lower())
         else:
