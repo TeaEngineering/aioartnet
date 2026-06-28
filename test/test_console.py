@@ -1166,3 +1166,19 @@ async def test_submaster_provenance_distinct_from_cue() -> None:
     await it.on_cmd("sub 1 at z")
     await engine.poll(0.0)
     assert engine.last_source[1] != SRC_SUB
+
+
+def test_colourmap_is_cyclic() -> None:
+    import math
+
+    from aioartnet.console import COLOUR_POINTS, COLOURMAPS, _LUT_STEPS
+
+    for name, points in COLOUR_POINTS.items():
+        lut = COLOURMAPS[name]
+        assert len(lut) == len(points) * _LUT_STEPS  # N segments incl. last->first
+        # the wrap from the last sample back to the first is a single small
+        # interpolation step (~1-2), not a discontinuous snap (which would be
+        # the full distance between the last and first control points, ~100s)
+        assert math.dist(lut[-1], lut[0]) < 5.0
+    # rainbow still starts on the first control point (red)
+    assert COLOURMAPS["rainbow"][0] == (255, 0, 0)

@@ -132,16 +132,24 @@ def apply_ci(
 
 
 # ---- effect engine -------------------------------------------------------
-# colourmaps are defined by control points (QLC+ style); each consecutive pair
-# is expanded to 300 linearly-interpolated samples, so a 2-point map is 300
-# samples and a 4-point map is 900.
+# colourmaps are defined by control points (QLC+ style) spread evenly around a
+# cycle: each segment (including the closing last->first) is expanded to
+# _LUT_STEPS interpolated samples, so an N-point map is N*_LUT_STEPS samples and
+# the animation blends smoothly back to the start instead of snapping.
 COLOUR_POINTS: dict[str, list[int]] = {
     "rainbow": [0xFF0000, 0x00FF00, 0x0000FF],
     "fire": [0xFFFF00, 0xFF0000, 0x000040, 0xFF0000],
     "abstract": [0x5571FF, 0x00FFFF, 0xFF00FF, 0xFFFF00],
     "ocean": [0x003AB9, 0x02EAFF],
+    # warm autumnal cycle: deep red -> burnt orange -> pumpkin -> amber gold.
+    # blue kept at 0 so the warm tones stay rich and don't wash toward white
+    "autumn": [0x661200, 0xA32E00, 0xD25800, 0xCC8400],
+    # punchy saturated stage palette for gigs: hot red -> magenta -> violet -> sky
+    "concert": [0xFF0040, 0xFF00E0, 0x6000FF, 0x00B0FF],
 }
-_LUT_STEPS = 300
+# 256 interpolation frames per segment: enough to step an 8-bit channel by 1
+# across a full 0->255 transition (more would be invisible at 8-bit output)
+_LUT_STEPS = 256
 
 
 def build_lut(points: list[int]) -> list[tuple[int, int, int]]:
@@ -149,7 +157,8 @@ def build_lut(points: list[int]) -> list[tuple[int, int, int]]:
         return ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
 
     lut: list[tuple[int, int, int]] = []
-    for a, b in zip(points, points[1:]):
+    # cyclic: pair each point with the next, wrapping last -> first
+    for a, b in zip(points, points[1:] + points[:1]):
         ra, ga, ba = rgb(a)
         rb, gb, bb = rgb(b)
         for s in range(_LUT_STEPS):
@@ -185,7 +194,10 @@ PT_PARAMS: dict[str, tuple] = {
 }
 EFFECT_PARAMS: dict[str, dict[str, tuple]] = {"rgb": RGB_PARAMS, "pt": PT_PARAMS}
 
-SPEED_MAX_HZ = 1.0  # animation rate at speed = 100%
+SPEED_MAX_HZ = 1.0  # pt: oscillation cycles per second at speed = 100%
+# rgb: LUT frames advanced per second at speed = 100%. 768 = 3 * _LUT_STEPS, so
+# at full speed a 3-point map (e.g. rainbow) cycles ~once per second.
+SPEED_MAX_FPS = 768.0
 PT_AMP_MAX = 127  # half coarse-range; *256 gives the 16-bit movement amplitude
 
 
@@ -227,12 +239,14 @@ class RgbEffect(Effect):
             return
         lut = COLOURMAPS[self.params["style"]]
         total = len(lut)
-        speed = float(self.params["speed"]) * SPEED_MAX_HZ
+        # speed advances the LUT at a frame rate (fps), independent of map size
+        base = float(self.params["speed"]) * SPEED_MAX_FPS * t
         spread = float(self.params["spread"])
         bri = float(self.params["intensity"])
         for lane in self.lanes:
-            phase = (speed * t + (lane.index / n) * spread) % 1.0
-            r, g, b = lut[int(phase * total) % total]
+            # spread offsets each fixture by a fraction of the whole map
+            idx = int(base + (lane.index / n) * spread * total) % total
+            r, g, b = lut[idx]
             for role, val in (("red", r), ("green", g), ("blue", b)):
                 ch = lane.channels.get(role)
                 if ch is None:
@@ -996,7 +1010,8 @@ Available commands:
   fx rgb|pt                         show a unit's params, values and choices
   fx rgb|pt group GRP               point an effect at a fixture group
   fx UNIT PARAM VALUE               set effect param (0-100, or style/mode name)
-            rgb: intensity speed spread style(rainbow|ocean|fire|abstract)
+            rgb: intensity speed spread
+                 style(rainbow|ocean|fire|abstract|autumn|concert)
             pt:  size speed spread mode(static|circle|wave|sway)
   fx rgb|pt off                     turn the unit off (rgb intensity/pt size to 0)
   fx pt home [PAN TILT]             capture (or set) the group's home positions
