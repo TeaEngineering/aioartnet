@@ -15,11 +15,17 @@ from typing import Any, Callable, Optional, Sequence
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout
-from prompt_toolkit.layout.containers import HSplit, VSplit, Window
+from prompt_toolkit.layout.containers import (
+    ConditionalContainer,
+    HSplit,
+    VSplit,
+    Window,
+)
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.styles import Style
 
@@ -59,6 +65,25 @@ class Bank:
     name: str
     looks: dict[str, Look] = field(default_factory=dict)
     active: Optional[str] = None
+
+
+# pan/tilt jog steps, in 16-bit units (coarse byte << 8 | fine byte)
+POS_COARSE = 1024
+POS_FINE = 64
+
+
+@dataclass
+class Positioning:
+    """Live pan/tilt aiming session for one or more fixtures (16-bit working).
+
+    `driving` True means the cursor keys jog the fixture; False means the
+    position is held but the cursor keys return to normal line editing (so the
+    `position store ...` command can be typed/edited)."""
+
+    targets: list[tuple[str, int]]
+    pan: dict[tuple[str, int], int]  # (label, number) -> 0..65535
+    tilt: dict[tuple[str, int], int]
+    driving: bool = True
 
 
 @dataclass
@@ -500,6 +525,9 @@ class MidiCC:
         self.note_listeners: dict[MidiKey, list[Callable[[bool], None]]] = (
             defaultdict(list)
         )
+        # priority CC handlers (UI editing, e.g. positioning): each may consume a
+        # CC by returning True, which suppresses the general listeners for it
+        self.cc_priority: list[Callable[[MidiKey, int], bool]] = []
 
     def _fire_note(self, key: MidiKey, pressed: bool) -> None:
         for listener in self.note_listeners.get(key, []):
@@ -536,8 +564,11 @@ class MidiCC:
                 self.notes_on[(chan, message[1])] = message[2]
             # CHANNEL_AFTERTOUCH / PROGRAM_CHANGE / clock / etc. are ignored
 
-        # dispatch CC changes seen this tick to any bound listeners
+        # dispatch CC changes seen this tick: priority (UI) handlers first; if
+        # one consumes the CC, the general bindings are inhibited for it
         for k, v in self.cc_pending.items():
+            if any(handler(k, v) for handler in self.cc_priority):
+                continue
             for listener in self.cc_listeners[k]:
                 listener(v)
         self.cc_pending.clear()
@@ -979,6 +1010,49 @@ class SubsView:
         return frags
 
 
+class PositionView:
+    """Shown only while aiming: targets and their 16-bit pan/tilt."""
+
+    def __init__(self, interpreter: "Interpreter") -> None:
+        self.it = interpreter
+
+    def render(self) -> StyleAndTextTuples:
+        pos = self.it.positioning
+        frags: StyleAndTextTuples = [("bold fg:#c060ff", " POSITION  ")]
+        if pos is None:
+            return frags
+        if pos.driving:
+            frags.append(("fg:#c060ff", "DRIVING — arrows jog, shift=fine, esc"))
+        else:
+            frags.append(
+                ("class:dim", "locked — 'position store B L', esc to release")
+            )
+        pan_cc = next(
+            (k for k, a in self.it.position_cc.items() if a == "pan"), None
+        )
+        tilt_cc = next(
+            (k for k, a in self.it.position_cc.items() if a == "tilt"), None
+        )
+        if pan_cc is not None and tilt_cc is not None:
+            frags.append(
+                (
+                    "class:dim",
+                    f"   CC pan={fmt_chan_num(pan_cc)}, tilt={fmt_chan_num(tilt_cc)}",
+                )
+            )
+        frags.append(("", "\n"))
+        for ref in pos.targets:
+            label, number = ref
+            frags.append(
+                (
+                    "fg:#c060ff" if pos.driving else "class:dim",
+                    f" {label} {number}  pan 0x{pos.pan[ref]:04X}"
+                    f"  tilt 0x{pos.tilt[ref]:04X}\n",
+                )
+            )
+        return frags
+
+
 HELP_TEXT = """\
 Available commands:
   live on|off                       enable/disable live edits in the output
@@ -1022,6 +1096,11 @@ Available commands:
   bank B L = fix ... ; fix ...      define a look (fix/chan commands)
   bank B off                        deactivate bank B
   midi bind note K bank B L         pad K activates look L in bank B
+  position SELECTOR                 aim fixtures (arrows jog, shift=fine, esc releases)
+  position drive                    resume cursor driving after esc
+  position cc PANCC TILTCC          also drive pan/tilt from two CC knobs
+  position store BANK LOOK          write the aim into a look (per-fixture)
+  position [off]                    show aiming state / release
   edits|edit|dirty                  show the current uncommitted edits
   go                                advance to the next cue
   back                              return to the previous cue
@@ -1065,6 +1144,13 @@ class Interpreter:
         self.homes: dict[tuple[str, int], tuple[int, int]] = {}
         # named look banks (mutually-exclusive high-level looks)
         self.banks: dict[str, Bank] = {}
+        # live pan/tilt aiming session (None when idle)
+        self.positioning: Optional[Positioning] = None
+        # persistent: which CCs drive pan/tilt during a drive session
+        self.position_cc: dict[MidiKey, str] = {}  # cc key -> "pan"/"tilt"
+        if self.midi is not None:
+            # UI editing layer: consumes the position CCs while driving
+            self.midi.cc_priority.append(self._position_cc_priority)
 
     def _fixture(self, label: str, number: int) -> PatchedFixture:
         try:
@@ -1412,6 +1498,179 @@ class Interpreter:
         else:
             raise ValueError(f"unknown bank command: {cmd!r}")
 
+    # ---- pan/tilt positioning ---------------------------------------------
+    def _read16(self, fx: PatchedFixture, axis: str) -> int:
+        coff = fx.profile.offset(axis)
+        foff = fx.profile.offset(f"{axis}_fine")
+        coarse = self.engine.live[fx.base + coff] if coff is not None else 128
+        fine = self.engine.live[fx.base + foff] if foff is not None else 0
+        return (coarse << 8) | fine
+
+    def _start_position(self, sel: list[str]) -> None:
+        fixtures, remainder = self._take_selector(sel)
+        if remainder:
+            raise ValueError(f"unknown fixtures: {remainder}")
+        targets = [
+            (fx.label, fx.number)
+            for fx in fixtures
+            if fx.profile.offset("pan") is not None
+        ]
+        if not targets:
+            raise ValueError("no fixtures with a pan channel selected")
+        pos = Positioning(targets=targets, pan={}, tilt={})
+        for label, number in targets:
+            fx = self._fixture(label, number)
+            pos.pan[(label, number)] = self._read16(fx, "pan")
+            pos.tilt[(label, number)] = self._read16(fx, "tilt")
+        self.engine.live_edit = True
+        self.positioning = pos
+        self._apply_position()
+
+    def _apply_position(self) -> None:
+        pos = self.positioning
+        if pos is None:
+            return
+        for ref in pos.targets:
+            fx = self._fixture(*ref)
+            for axis, val16 in (("pan", pos.pan[ref]), ("tilt", pos.tilt[ref])):
+                co = fx.profile.offset(axis)
+                if co is not None:
+                    self.engine.add_edit(
+                        ChannelIntensity(fx.base + co, (val16 >> 8) & 0xFF)
+                    )
+                fo = fx.profile.offset(f"{axis}_fine")
+                if fo is not None:
+                    self.engine.add_edit(
+                        ChannelIntensity(fx.base + fo, val16 & 0xFF)
+                    )
+
+    def _nudge(self, axis: str, direction: int, fine: bool) -> None:
+        pos = self.positioning
+        if pos is None:
+            return
+        step = POS_FINE if fine else POS_COARSE
+        working = pos.pan if axis == "pan" else pos.tilt
+        for ref in pos.targets:
+            working[ref] = max(0, min(65535, working[ref] + direction * step))
+        self._apply_position()
+
+    def _set_axis16(self, axis: str, val16: int) -> None:
+        # used by the positioning CC listeners (drives all targets together)
+        pos = self.positioning
+        if pos is None:
+            return
+        working = pos.pan if axis == "pan" else pos.tilt
+        for ref in pos.targets:
+            working[ref] = max(0, min(65535, val16))
+        self._apply_position()
+
+    def _position_off(self) -> None:
+        pos = self.positioning
+        if pos is None:
+            return
+        # drop the positioning live edits so a look/effect can take over
+        drop = set()
+        for ref in pos.targets:
+            fx = self._fixture(*ref)
+            for role in ("pan", "pan_fine", "tilt", "tilt_fine"):
+                off = fx.profile.offset(role)
+                if off is not None:
+                    drop.add(fx.base + off)
+        self.engine.edits = [e for e in self.engine.edits if e.channel not in drop]
+        self.positioning = None
+
+    def _resume_driving(self) -> None:
+        if self.positioning is None:
+            raise ValueError("no positioning session (use: position <selector>)")
+        self.positioning.driving = True
+
+    def _position_escape(self) -> None:
+        # esc steps down: driving -> locked (line editing) -> released
+        pos = self.positioning
+        if pos is None:
+            return
+        if pos.driving:
+            pos.driving = False
+        else:
+            self._position_off()
+
+    def _show_positioning(self) -> None:
+        pos = self.positioning
+        if pos is None:
+            print("not positioning (use: position <selector>)")
+            return
+        mode = "driving (arrows jog)" if pos.driving else "locked (line editing)"
+        names = ", ".join(f"{label} {number}" for label, number in pos.targets)
+        print(f"positioning {names}  [{mode}]")
+        for ref in pos.targets:
+            label, number = ref
+            print(
+                f"  {label} {number}  pan 0x{pos.pan[ref]:04X}  "
+                f"tilt 0x{pos.tilt[ref]:04X}"
+            )
+
+    def _position_cc(self, pancc: str, tiltcc: str) -> None:
+        # persistent assignment; only acts while a session is driving
+        self.position_cc = {
+            parse_chan_num(pancc): "pan",
+            parse_chan_num(tiltcc): "tilt",
+        }
+
+    def _position_cc_priority(self, key: MidiKey, value: int) -> bool:
+        # priority (UI) layer: while driving, the position CCs aim the heads and
+        # are consumed (return True) so their general bindings don't also fire
+        pos = self.positioning
+        if pos is not None and pos.driving and key in self.position_cc:
+            self._set_axis16(self.position_cc[key], round(value / 127 * 65535))
+            return True
+        return False
+
+    def _capture_command(self, label: str, number: int) -> str:
+        ref = (label, number)
+        pos = self.positioning
+        assert pos is not None
+        fx = self._fixture(label, number)
+        parts = [f"fix {label} {number}"]
+        for axis, val16 in (("pan", pos.pan[ref]), ("tilt", pos.tilt[ref])):
+            parts.append(f"{axis} 0x{(val16 >> 8) & 0xFF:02X}")
+            if fx.profile.offset(f"{axis}_fine") is not None:
+                parts.append(f"{axis}_fine 0x{val16 & 0xFF:02X}")
+        return " ".join(parts)
+
+    async def _store_position(self, bank: str, look: str) -> None:
+        if self.positioning is None:
+            raise ValueError("nothing to store: position <selector> first")
+        for label, number in self.positioning.targets:
+            cmd = self._capture_command(label, number)
+            await self._merge_into_look(bank, look, label, number, cmd)
+
+    @staticmethod
+    def _targets_single_fixture(cmd: str, label: str, number: int) -> bool:
+        toks = cmd.split()
+        return (
+            len(toks) >= 3
+            and toks[0] in ("fix", "fixture")
+            and toks[1] == label
+            and toks[2] == str(number)
+            and (len(toks) < 4 or toks[3] != "thru")
+        )
+
+    async def _merge_into_look(
+        self, bank: str, look: str, label: str, number: int, command: str
+    ) -> None:
+        b = self.banks.setdefault(bank, Bank(name=bank))
+        existing = b.looks.get(look)
+        commands = list(existing.commands) if existing else []
+        # replace only this fixture's own single-fixture command, keep the rest
+        commands = [
+            c for c in commands if not self._targets_single_fixture(c, label, number)
+        ]
+        commands.append(command)
+        compiled = await self._compile_commands(commands)
+        b.looks[look] = Look(name=look, commands=commands, compiled=compiled)
+        if b.active == look:
+            self.engine.looks[bank] = compiled
+
     def _set_fx_param(self, unit: str, param: str, value: str) -> None:
         eff = self._ensure_effect(unit)
         spec = EFFECT_PARAMS[unit].get(param)
@@ -1699,6 +1958,13 @@ class Interpreter:
                 lines.append(
                     f"midi bind note {note} fx {tgt[1]} {tgt[2]} {tgt[3]}"
                 )
+        # persistent positioning CC assignment
+        pan_cc = next((k for k, a in self.position_cc.items() if a == "pan"), None)
+        tilt_cc = next((k for k, a in self.position_cc.items() if a == "tilt"), None)
+        if pan_cc is not None and tilt_cc is not None:
+            lines.append(
+                f"position cc {fmt_chan_num(pan_cc)} {fmt_chan_num(tilt_cc)}"
+            )
         # session state: restore live-edit mode if it was on (emit last, after
         # the record blocks, so it doesn't apply their transient `chan` edits)
         if self.engine.live_edit:
@@ -1789,6 +2055,18 @@ class Interpreter:
                 self._list_banks()
             case ["bank", _bankname, *_rest]:
                 await self._bank_cmd(cmd)
+            case ["position" | "pos"]:
+                self._show_positioning()
+            case ["position" | "pos", "off"]:
+                self._position_off()
+            case ["position" | "pos", "drive"]:
+                self._resume_driving()
+            case ["position" | "pos", "cc", pancc, tiltcc]:
+                self._position_cc(pancc, tiltcc)
+            case ["position" | "pos", "store", bank, look]:
+                await self._store_position(bank, look)
+            case ["position" | "pos", *sel]:
+                self._start_position(sel)
             case ["fix" | "fixture"]:
                 if self.fixtures:
                     for fx in self.fixtures.values():
@@ -1967,6 +2245,7 @@ async def main(
     fx_view = FxView(engine)
     looks_view = LooksView(interpreter)
     subs_view = SubsView(engine)
+    position_view = PositionView(interpreter)
 
     history = FileHistory(os.path.expanduser("~/.aioartnet-console-history"))
 
@@ -2042,6 +2321,20 @@ async def main(
                 wrap_lines=True,
                 style="class:subs",
             ),
+            # POSITION pane only takes space while a positioning session is live
+            ConditionalContainer(
+                HSplit(
+                    [
+                        Window(height=1, char="─", style="class:sep"),
+                        Window(
+                            content=FormattedTextControl(position_view.render),
+                            wrap_lines=True,
+                            style="class:position",
+                        ),
+                    ]
+                ),
+                filter=Condition(lambda: interpreter.positioning is not None),
+            ),
             Window(height=1, char="─", style="class:sep"),
             Window(
                 content=BufferControl(buffer=log_buffer, focusable=False),
@@ -2064,6 +2357,38 @@ async def main(
     @kb.add("c-d")
     def _exit(event: Any) -> None:
         event.app.exit()
+
+    # cursor-driving: arrows jog pan/tilt only while a session is "driving";
+    # shift+arrow = fine. Esc steps down: driving -> locked -> released.
+    driving = Condition(
+        lambda: interpreter.positioning is not None
+        and interpreter.positioning.driving
+    )
+    has_position = Condition(lambda: interpreter.positioning is not None)
+
+    def _jog(axis: str, direction: int, fine: bool) -> Callable[[Any], None]:
+        def handler(event: Any) -> None:
+            interpreter._nudge(axis, direction, fine)
+            event.app.invalidate()
+
+        return handler
+
+    for keyname, axis, direction, fine in (
+        ("left", "pan", -1, False),
+        ("right", "pan", 1, False),
+        ("up", "tilt", 1, False),
+        ("down", "tilt", -1, False),
+        ("s-left", "pan", -1, True),
+        ("s-right", "pan", 1, True),
+        ("s-up", "tilt", 1, True),
+        ("s-down", "tilt", -1, True),
+    ):
+        kb.add(keyname, filter=driving)(_jog(axis, direction, fine))
+
+    @kb.add("escape", filter=has_position, eager=True)
+    def _esc_position(event: Any) -> None:
+        interpreter._position_escape()  # driving -> locked -> released
+        event.app.invalidate()
 
     style = Style.from_dict({"dim": "#808080", "sep": "#444444"})
 

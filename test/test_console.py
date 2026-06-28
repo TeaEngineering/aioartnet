@@ -1182,3 +1182,194 @@ def test_colourmap_is_cyclic() -> None:
         assert math.dist(lut[-1], lut[0]) < 5.0
     # rainbow still starts on the first control point (red)
     assert COLOURMAPS["rainbow"][0] == (255, 0, 0)
+
+
+def _pt_profiles():  # type: ignore[no-untyped-def]
+    from aioartnet.console import load_profiles
+
+    # head with 16-bit pan/tilt: pan@0 pan_fine@1 tilt@2 tilt_fine@3 dimmer@4
+    return load_profiles(
+        {"fixtures": {"head": ["pan", "pan_fine", "tilt", "tilt_fine", "dimmer"]}}
+    )
+
+
+@pytest.mark.asyncio
+async def test_position_nudge_16bit() -> None:
+    from aioartnet.console import POS_COARSE, POS_FINE
+
+    engine = Engine(Mock(), universe_size=40)
+    it = Interpreter(engine, profiles=_pt_profiles())
+    await it.on_cmd("patch head head 1 @ 1")  # base 0
+    await it.on_cmd("position head 1")
+
+    it._nudge("pan", 1, fine=False)  # +POS_COARSE
+    it._nudge("pan", 1, fine=True)  # +POS_FINE
+    await engine.poll(0.0)
+    pan16 = POS_COARSE + POS_FINE
+    assert it.positioning.pan[("head", 1)] == pan16  # type: ignore[union-attr]
+    live = _captured(engine)
+    assert live[0] == pan16 >> 8  # pan coarse
+    assert live[1] == pan16 & 0xFF  # pan fine
+
+
+@pytest.mark.asyncio
+async def test_position_capture_command_exact() -> None:
+    engine = Engine(Mock(), universe_size=40)
+    it = Interpreter(engine, profiles=_pt_profiles())
+    await it.on_cmd("patch head head 1 @ 1")
+    await it.on_cmd("position head 1")
+    it._nudge("pan", 5, fine=False)
+    it._nudge("tilt", 3, fine=True)
+
+    cmd = it._capture_command("head", 1)
+    # replaying the captured command reproduces the same channel bytes
+    pan16 = it.positioning.pan[("head", 1)]  # type: ignore[union-attr]
+    tilt16 = it.positioning.tilt[("head", 1)]  # type: ignore[union-attr]
+    it2 = Interpreter(Engine(Mock(), universe_size=40), profiles=_pt_profiles())
+    await it2.on_cmd("patch head head 1 @ 1")
+    await it2.on_cmd("live on")
+    await it2.on_cmd(cmd)
+    out = _captured(it2.engine)
+    assert (out[0], out[1]) == (pan16 >> 8, pan16 & 0xFF)
+    assert (out[2], out[3]) == (tilt16 >> 8, tilt16 & 0xFF)
+
+
+@pytest.mark.asyncio
+async def test_position_store_non_destructive() -> None:
+    engine = Engine(Mock(), universe_size=40)
+    it = Interpreter(engine, profiles=_pt_profiles())
+    await it.on_cmd("patch head head 1 thru 2 @ 1")  # footprint 5 -> base 0, 5
+    await it.on_cmd("group heads = head 1 thru 2")
+    await it.on_cmd(
+        "bank pos fan = fix head 1 pan 0x10 tilt 0x10 ; fix head 2 pan 0x20 tilt 0x20"
+    )
+
+    await it.on_cmd("position head 1")
+    it._nudge("pan", 2, fine=False)
+    await it.on_cmd("position store pos fan")
+
+    cmds = it.banks["pos"].looks["fan"].commands
+    # head 2's command is untouched, head 1 appears exactly once (replaced)
+    assert "fix head 2 pan 0x20 tilt 0x20" in cmds
+    assert sum(c.startswith("fix head 1") for c in cmds) == 1
+
+    # re-storing head 1 again still leaves a single head-1 command (no dupes)
+    it._nudge("pan", 1, fine=False)
+    await it.on_cmd("position store pos fan")
+    cmds = it.banks["pos"].looks["fan"].commands
+    assert sum(c.startswith("fix head 1") for c in cmds) == 1
+    assert "fix head 2 pan 0x20 tilt 0x20" in cmds
+
+
+@pytest.mark.asyncio
+async def test_position_store_preserves_group_command() -> None:
+    engine = Engine(Mock(), universe_size=40)
+    it = Interpreter(engine, profiles=_pt_profiles())
+    await it.on_cmd("patch head head 1 thru 2 @ 1")
+    await it.on_cmd("group heads = head 1 thru 2")
+    await it.on_cmd("bank pos base = fix heads pan 0x40 tilt 0x40")
+
+    await it.on_cmd("position head 1")
+    it._nudge("pan", 1, fine=False)
+    await it.on_cmd("position store pos base")
+    await it.on_cmd("bank pos base")  # activate
+    await engine.poll(0.0)
+
+    cmds = it.banks["pos"].looks["base"].commands
+    assert "fix heads pan 0x40 tilt 0x40" in cmds  # group command preserved
+    live = _captured(engine)
+    # head 2 keeps the group value 0x40; head 1 overridden by its own command
+    assert live[5] == 0x40  # head 2 pan
+    assert live[0] != 0x40  # head 1 pan moved
+
+
+@pytest.mark.asyncio
+async def test_position_cc_drive() -> None:
+    from aioartnet.console import CONTROLLER_CHANGE, MidiCC
+
+    engine = Engine(Mock(), universe_size=40)
+    fake = _FakeMidiIn()
+    midi = MidiCC(fake)
+    it = Interpreter(engine, midi=midi, profiles=_pt_profiles())
+    await it.on_cmd("patch head head 1 @ 1")
+    await it.on_cmd("position head 1")
+    await it.on_cmd("position cc 0:70 0:71")
+
+    fake.feed([CONTROLLER_CHANGE, 70, 64])  # ch0 cc70 -> pan
+    midi.poll()
+    assert it.positioning.pan[("head", 1)] == round(64 / 127 * 65535)  # type: ignore[union-attr]
+
+    await it.on_cmd("position off")
+    assert it.positioning is None
+
+
+@pytest.mark.asyncio
+async def test_position_two_level_escape() -> None:
+    engine = Engine(Mock(), universe_size=40)
+    it = Interpreter(engine, profiles=_pt_profiles())
+    await it.on_cmd("patch head head 1 @ 1")
+
+    # regular -> driving
+    await it.on_cmd("position head 1")
+    assert it.positioning is not None and it.positioning.driving is True
+
+    # esc #1: driving -> locked (session held, cursor keys free for line editing)
+    it._position_escape()
+    assert it.positioning is not None and it.positioning.driving is False
+
+    # storing still works while locked
+    await it.on_cmd("position store pos aim")
+    assert it.banks["pos"].looks["aim"].commands[0].startswith("fix head 1")
+    assert it.positioning is not None  # still held
+
+    # resume cursor driving
+    await it.on_cmd("position drive")
+    assert it.positioning.driving is True
+
+    # esc #1 again -> locked, esc #2 -> released
+    it._position_escape()
+    it._position_escape()
+    assert it.positioning is None
+
+
+@pytest.mark.asyncio
+async def test_position_cc_persists_and_inhibits() -> None:
+    from aioartnet.console import CONTROLLER_CHANGE, MidiCC
+
+    engine = Engine(Mock(), universe_size=40)
+    fake = _FakeMidiIn()
+    midi = MidiCC(fake)
+    it = Interpreter(engine, midi=midi, profiles=_pt_profiles())
+    await it.on_cmd("patch head head 1 @ 1")
+    await it.on_cmd("chan 20 at f")
+    await it.on_cmd("record sub 1")
+    await it.on_cmd("midi bind cc 0:70 sub 1")  # cc70 normally drives sub 1
+    await it.on_cmd("position cc 0:70 0:71")  # cc70 also = position pan (persistent)
+
+    # not driving -> cc70 goes to the general binding (drives the sub)
+    fake.feed([CONTROLLER_CHANGE, 70, 127])
+    midi.poll()
+    assert engine.subs[0].intensity == 1.0
+    assert it.positioning is None
+
+    # driving -> cc70 aims the head and is INHIBITED from the sub (consumed)
+    await it.on_cmd("position head 1")
+    fake.feed([CONTROLLER_CHANGE, 70, 64])
+    midi.poll()
+    assert it.positioning.pan[("head", 1)] == round(64 / 127 * 65535)  # type: ignore[union-attr]
+    assert engine.subs[0].intensity == 1.0  # unchanged: the CC was consumed
+
+    # locked (not driving) again -> general dispatch resumes
+    it._position_escape()  # driving -> locked
+    fake.feed([CONTROLLER_CHANGE, 70, 0])
+    midi.poll()
+    assert engine.subs[0].intensity == 0.0  # sub moved again
+
+    # assignment persists across sessions and round-trips through save
+    it._position_off()
+    assert it.position_cc != {}
+    await it.on_cmd("position head 1")
+    fake.feed([CONTROLLER_CHANGE, 71, 100])
+    midi.poll()
+    assert it.positioning.tilt[("head", 1)] == round(100 / 127 * 65535)  # type: ignore[union-attr]
+    assert "position cc 0:70 0:71" in it.serialise()
